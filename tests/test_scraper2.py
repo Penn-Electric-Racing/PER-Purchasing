@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import scraper2 as s  # noqa: E402
+from ranking import Scorer  # noqa: E402
 
 PAGE = """<html><head>
 <script type="application/ld+json">{"@type": "Product", "name": "LM7805",
@@ -197,7 +198,7 @@ def test_apply_qty_frees_shipping_only_above_threshold():
 
 def test_snippet_prices_rank_below_page_prices():
     page, snip = candidate(1, 1.00), candidate(0, 1.00, cost_source="llm snippet")
-    s.score_all([snip, page], "LM7805", 1)
+    Scorer().score_all([snip, page], "LM7805", 1)
     assert page["score"] < snip["score"]
 
 

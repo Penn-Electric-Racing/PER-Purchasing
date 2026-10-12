@@ -3,7 +3,7 @@
 scraper.py - Find the best 5 places to buy a part.
 
 Searches ~30 results, scrapes each for price / supplier / stock / shipping,
-then ranks them and returns the top 5 (see "ranking" section for the weights).
+then ranks them and returns the top 5 (weights in ranking.py).
 
 Search sources (first that works wins; no google.com scraping, so no CAPTCHAs):
   1. Brave Search API        (free tier, ~2k queries/mo)   env: BRAVE_API_KEY
@@ -18,7 +18,7 @@ and quantity price breaks: schema.org JSON-LD first, then meta/microdata
 tags, then regex over page text and the search snippet. Sites that block
 scripts (eBay, DigiKey, ...) fall back to the snippet.
 
-Ranking (--rank best, default):
+Ranking (--rank best, default; weights in ranking.py or --weights file.json):
   score = order cost incl. shipping / cheapest order cost  x  penalties for
   out-of-stock or short stock, slow or unknown shipping, estimated shipping
   cost, low-confidence price (snippet / search-results page), listings that
@@ -46,14 +46,13 @@ import random
 import re
 import sys
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
-from statistics import median
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+from ranking import Scorer, Weights, _alnum, relevance, ship_days  # noqa: F401
 
 TIMEOUT = 15
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -61,12 +60,16 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 class BackendError(Exception):
-    pass
+    """A search backend or page fetch failed (missing key, HTTP error, not HTML...)."""
 
 
 # ---------------------------------------------------------------- backends
 # Each backend pages through results until it has `n` (or runs out).
 def brave(query, n):
+    """Up to `n` results from the Brave Search API (needs BRAVE_API_KEY).
+
+    Returns [{"title", "url", "snippet"}, ...]; raises BackendError if the first page fails.
+    """
     key = os.getenv("BRAVE_API_KEY")
     if not key:
         raise BackendError("BRAVE_API_KEY not set")
@@ -92,6 +95,7 @@ def brave(query, n):
 
 
 def serper(query, n):
+    """Up to `n` Google results via Serper.dev (needs SERPER_API_KEY), 10 per request."""
     key = os.getenv("SERPER_API_KEY")
     if not key:
         raise BackendError("SERPER_API_KEY not set")
@@ -116,6 +120,9 @@ def serper(query, n):
 
 
 def google_cse(query, n):
+    """Up to `n` (max 100) results from Google Programmable Search
+    (needs GOOGLE_API_KEY and GOOGLE_CSE_ID), 10 per request.
+    """
     key, cx = os.getenv("GOOGLE_API_KEY"), os.getenv("GOOGLE_CSE_ID")
     if not (key and cx):
         raise BackendError("GOOGLE_API_KEY / GOOGLE_CSE_ID not set")
@@ -140,6 +147,7 @@ def google_cse(query, n):
 
 def _clean_ddg_url(href):
     # DDG sometimes wraps links: //duckduckgo.com/l/?uddg=<encoded>
+    """Unwrap DuckDuckGo's //duckduckgo.com/l/?uddg=<url> redirect links."""
     if "duckduckgo.com/l/" in href:
         qs = parse_qs(urlparse(href).query)
         if "uddg" in qs:
@@ -197,6 +205,9 @@ def _ddg_page(form, retries=2):
 
 
 def duckduckgo(query, n):
+    """Up to `n` results from DuckDuckGo's HTML page (no key), following its
+    "Next" form with a pause between pages. Keeps partial results if a later page fails.
+    """
     out, form = [], {"q": query}
     while form and len(out) < n:
         if out:
@@ -272,6 +283,7 @@ OUT_OF_STOCK_RE = re.compile(r"\b(?:out\sof\sstock|sold\sout|currently\sunavaila
 
 
 def _to_float(s):
+    """"1,234.50" / 12 / None -> float, or None if it isn't a number."""
     try:
         return float(str(s).replace(",", ""))
     except (TypeError, ValueError):
@@ -299,17 +311,20 @@ def _iter_ld(node, skip=frozenset(), product=None):
 
 
 def _same_url(a, b):
+    """True if two URLs point at the same page (ignores www., trailing / and fragment)."""
     a, b = urlparse(a or ""), urlparse(b or "")
     return bool(a.netloc) and (a.netloc.removeprefix("www."), a.path.rstrip("/"), a.query) == \
         (b.netloc.removeprefix("www."), b.path.rstrip("/"), b.query)
 
 
 def _types(d):
+    """A JSON-LD node's @type as a set (it may be a string or a list)."""
     t = d.get("@type", [])
     return {t} if isinstance(t, str) else set(t or [])
 
 
 def _fmt_span(lo, hi, unit="days"):
+    """(2, 5) -> "2-5 days", (None, 3) -> "3 days", (2, None) -> "2+ days"."""
     if lo is None and hi is None:
         return None
     if lo is None or lo == hi:
@@ -331,6 +346,7 @@ def _ld_breaks(offer, info):
 
 
 def _min_qty(offer):
+    """Minimum order quantity of a JSON-LD offer (eligibleQuantity), default 1."""
     eq = offer.get("eligibleQuantity")
     return (_to_float(eq.get("minValue") or eq.get("value")) or 1) if isinstance(eq, dict) else 1
 
@@ -414,7 +430,11 @@ def _from_json_ld(soup, info, page_url="", title="", listing=False):
 
 
 def _from_meta(soup, info):
+    """Fill price/currency from <meta> or itemprop=price tags, and the supplier from
+    og:site_name, when JSON-LD didn't provide them.
+    """
     def meta(*names):
+        """Content of the first <meta property|name=...> found among `names`."""
         for n in names:
             m = soup.find("meta", attrs={"property": n}) or soup.find("meta", attrs={"name": n})
             if m and m.get("content"):
@@ -466,6 +486,10 @@ def _ship_threshold(s):
 
 
 def _from_text(text, info, source, listing=False):
+    """Regex fallback over plain text: fills price, shipping cost / free-shipping
+    minimum, shipping time, stock and in/out of stock, only where `info` is still empty.
+    `source` labels where a found price came from; `listing` takes the lowest price.
+    """
     if info["cost"] is None:
         prices = _text_prices(text)
         if prices:
@@ -557,6 +581,7 @@ def apply_qty(r, qty):
 
 
 def _blank_info():
+    """Empty per-listing info dict with every field part_info / apply_qty expect."""
     return {"cost": None, "currency": None, "cost_source": None, "supplier": None,
             "shipping_time": None, "shipping_cost": None, "free_ship_min": None,
             "stock": None, "in_stock": None,
@@ -629,176 +654,15 @@ def part_info(result):
 
 
 def enrich(results):
+    """Run part_info over all results in parallel (up to 10 pages at once)."""
     with ThreadPoolExecutor(max_workers=min(10, len(results) or 1)) as pool:
         return list(pool.map(part_info, results))
 
 
 # ---------------------------------------------------------------- ranking
-# Score = (effective order cost / cheapest effective cost) x penalty multipliers.
-# 1.00 is the cheapest candidate with nothing counting against it; lower is better.
-# Tune the weights here.
-PENALTY = {
-    "out_of_stock": 1.6,        # listed as out of stock / backordered
-    "short_stock": 1.4,         # stock shown but below the quantity needed
-    "stock_unknown": 1.03,
-    "per_ship_day": 0.02,       # +2% per day of shipping beyond FAST_DAYS...
-    "ship_day_cap": 0.40,       # ...capped at +40%
-    "ship_time_unknown": 1.06,
-    "ship_cost_unknown": 1.04,  # on top of adding the median known shipping cost
-    "source": {"json-ld": 1.0, "meta": 1.0, "page text": 1.05, "snippet": 1.15},
-    "listing_page": 1.12,       # price is the lowest of many listings, may not be this part
-    "relevance": 0.6,           # x(1 + 0.6 * fraction of query words missing)
-    "mpn_variant": 1.08,        # part number only inside a longer code (LM317L for LM317)
-    "outlier": 1.35,            # unit cost < 25% of the median: likely wrong item/accessory
-    "per_search_rank": 0.005,   # tiny tiebreak favouring higher search positions
-}
-FAST_DAYS = 2
-
-
-def _alnum(s):
-    return re.sub(r"[^a-z0-9]", "", s.lower())
-
-
-def relevance(query, r):
-    """(fraction of query words found, part-number match, variant codes seen instead).
-    Part numbers = words with digits. If a part number only shows up inside a longer
-    code (LM317L for LM317), that's a variant: maybe the same part in another package,
-    maybe a different part, so it's listed for the user to check."""
-    words = [w for w in re.findall(r"[a-z0-9][a-z0-9.\-/x]*", query.lower())
-             if w not in {"price", "buy", "in", "stock", "for", "the", "a"}]
-    raw = f"{r['title']} {r.get('page_title') or ''} {r['snippet']} {unquote(r['url'])}"
-    hay = _alnum(raw)
-    found = [w for w in words if _alnum(w) and _alnum(w) in hay]
-    keys = [w for w in words if re.search(r"\d", w)]
-    key_hit = not keys or any(_alnum(k) in hay for k in keys)
-    tokens = {_alnum(t): t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9.\-]*", raw)}
-    variants = []
-    for k in map(_alnum, keys):
-        if k not in tokens:  # no exact token: collect the longer codes it appears in
-            variants += [t for a, t in tokens.items() if k in a and t not in variants]
-    return (len(found) / len(words) if words else 1.0), key_hit, variants
-
-
-def ship_days(text, today=None):
-    """Rough worst-case days until delivery from a shipping_time string."""
-    if not text:
-        return None
-    t, today = text.lower(), today or date.today()
-    if "today" in t or "same" in t:
-        return 1
-    if "next business day" in t:
-        return 2
-    m = re.search(r"(\d+)(?:\s?(?:-|–|to)\s?(\d+))?\s?(?:business\s|working\s)?(hour|day|week)", t)
-    if m:
-        n = int(m.group(2) or m.group(1))
-        return {"hour": max(1, -(-n // 24)), "day": n, "week": 7 * n}[m.group(3)]
-    m = re.search(r"([a-z]{3})[a-z]*\.?\s(\d{1,2})$", t)
-    if m:
-        try:
-            d = datetime.strptime(f"{m.group(1)} {m.group(2)} {today.year}", "%b %d %Y").date()
-        except ValueError:
-            return None
-        if d < today:
-            d = d.replace(year=today.year + 1)
-        return max((d - today).days, 1)
-    return None
-
-
-def _ship_value(ship):
-    if ship == "Free":
-        return 0.0
-    return _to_float(re.sub(r"[^\d.]", "", ship or "") or None)
-
-
-def score_all(results, query, qty):
-    """Attach score + human-readable notes to every priced, relevant candidate."""
-    priced = [r for r in results if r["subtotal"] is not None]
-    known_ship = [v for v in (_ship_value(r["shipping_cost"]) for r in priced) if v is not None]
-    ship_fill = median(known_ship) if known_ship else 0.0
-    units = [r["unit_cost"] for r in priced if r["unit_cost"]]
-    med_unit = median(units) if units else None
-    main_cur = Counter(r["currency"] for r in priced).most_common(1)[0][0] if priced else None
-
-    for r in results:
-        r["score"], r["notes"] = None, []
-        r["relevance"], key_hit, r["mpn_variants"] = relevance(query, r)
-        if r["subtotal"] is None:
-            r["notes"].append("no price found")
-            continue
-        if not key_hit:
-            r["notes"].append("part number not in listing")
-        elif r["mpn_variants"]:
-            r["notes"].append(f"listed as {', '.join(r['mpn_variants'][:3])} - check suffix")
-        if r["currency"] and main_cur and r["currency"] != main_cur:
-            r["notes"].append(f"priced in {r['currency']}, not {main_cur}")
-        ship = _ship_value(r["shipping_cost"])
-        r["effective_cost"] = round(r["subtotal"] + (ship if ship is not None else ship_fill), 2)
-
-    ok = [r for r in results if r["subtotal"] is not None]
-    # Baseline = cheapest *valid* option, so a wrong-part bargain doesn't skew everyone.
-    valid = [r["effective_cost"] for r in ok if not r["notes"]] or \
-        [r["effective_cost"] for r in ok]
-    best = min(valid, default=0) or 0.01
-    for r in ok:
-        mult, notes = 1.0, r["notes"]
-        if r["enough_stock"] is False and r["in_stock"] is False:
-            mult *= PENALTY["out_of_stock"]; notes.append("out of stock")
-        elif r["enough_stock"] is False:
-            mult *= PENALTY["short_stock"]; notes.append(f"stock below {qty}")
-        elif r["enough_stock"] is None and r["in_stock"] is None:
-            mult *= PENALTY["stock_unknown"]
-        days = ship_days(r["shipping_time"])
-        r["ship_days"] = days
-        if days is None:
-            mult *= PENALTY["ship_time_unknown"]
-        elif days > FAST_DAYS:
-            mult *= 1 + min(PENALTY["per_ship_day"] * (days - FAST_DAYS), PENALTY["ship_day_cap"])
-            if days >= 10:
-                notes.append(f"slow: ~{days} days")
-        if _ship_value(r["shipping_cost"]) is None:
-            mult *= PENALTY["ship_cost_unknown"]; notes.append("shipping cost estimated")
-        src = (r["cost_source"] or "snippet").split(" (")[0]
-        mult *= PENALTY["source"].get(src, 1.1)
-        if r["listing_page"]:
-            mult *= PENALTY["listing_page"]; notes.append("search page: lowest listing")
-        mult *= 1 + PENALTY["relevance"] * (1 - r["relevance"])
-        if r["mpn_variants"]:
-            mult *= PENALTY["mpn_variant"]
-        if med_unit and len(units) >= 4 and r["unit_cost"] < 0.25 * med_unit:
-            mult *= PENALTY["outlier"]; notes.append("far cheaper than others - verify item")
-        mult *= 1 + PENALTY["per_search_rank"] * r["search_rank"]
-        r["score"] = round(r["effective_cost"] / best * mult, 3)
-    return results
-
-
-def pick_top(results, top, mode="best", per_supplier=2):
-    """Best `top` options. Hard filters first; loosened only if too few candidates pass."""
-    def tier(r):
-        if r["score"] is None:
-            return 3  # unpriced
-        if "part number not in listing" in r["notes"] or any(
-                n.startswith("priced in") for n in r["notes"]):
-            return 2
-        if r["enough_stock"] is False:
-            return 1
-        return 0
-
-    key = (lambda r: r["effective_cost"]) if mode == "cheapest" else (lambda r: r["score"])
-    ordered = sorted(results, key=lambda r: (tier(r), key(r) if tier(r) < 3 else -r["relevance"],
-                                             r["search_rank"]))
-    picked, per = [], Counter()
-    for r in ordered:  # first pass: cap listings per supplier for variety
-        if per[r["supplier"]] < per_supplier:
-            picked.append(r); per[r["supplier"]] += 1
-        if len(picked) == top:
-            break
-    for r in ordered:  # fill up if the cap left gaps
-        if len(picked) == top:
-            break
-        if r not in picked:
-            picked.append(r)
-    picked.sort(key=lambda r: ordered.index(r))
-    return picked
+# Scoring lives in ranking.py (tune Weights there, or pass --weights file.json).
+SCORER = Scorer()
+score_all, pick_top = SCORER.score_all, SCORER.pick_top
 
 
 # ---------------------------------------------------------------- main
@@ -834,6 +698,7 @@ def search(query, n=5, verbose=False, variants=()):
 
 
 def main():
+    """Command-line entry point: search, scrape, score and print or dump JSON."""
     p = argparse.ArgumentParser(
         description="Search many part listings, then rank the best N by cost/stock/shipping.")
     p.add_argument("query", nargs="+")
@@ -852,11 +717,19 @@ def main():
                    help="search the query as-is (default appends 'price' to favor listings)")
     p.add_argument("--no-fetch", action="store_true",
                    help="don't fetch result pages; only parse search snippets")
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--weights", metavar="FILE",
+                   help="JSON file overriding ranking weights, e.g. {\"out_of_stock\": 2.0} "
+                        "(see Weights in ranking.py)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="log skipped backends, retries and fetch errors to stderr")
     a = p.parse_args()
     if a.qty < 1 or a.top < 1 or a.pool < a.top:
         p.error("need --qty >= 1, --top >= 1 and --pool >= --top")
 
+    try:
+        scorer = Scorer(Weights.load(a.weights) if a.weights else None)
+    except (OSError, ValueError) as e:
+        p.error(f"--weights: {e}")
     base = " ".join(a.query)
     query = base if a.exact or "price" in base.lower() else base + " price"
     variants = () if a.exact else (f"buy {base}", f"{base} in stock")
@@ -884,8 +757,8 @@ def main():
     else:
         results = enrich(results)
     results = [apply_qty(r, a.qty) for r in results]
-    score_all(results, base, a.qty)
-    top = pick_top(results, a.top, a.rank, a.per_supplier)
+    scorer.score_all(results, base, a.qty)
+    top = scorer.pick_top(results, a.top, a.rank, a.per_supplier)
     stats = {"candidates": len(results),
              "fetched": sum(not r.get("fetch_error") for r in results),
              "priced": sum(r["subtotal"] is not None for r in results)}
@@ -899,6 +772,7 @@ def main():
           f'ranked by {a.rank})\n')
 
     def money(v, cur):
+        """Format an amount with its currency, or "n/a"."""
         return "n/a" if v is None else f"{v:,.2f} {cur or ''}".strip()
 
     for i, r in enumerate(top, 1):
