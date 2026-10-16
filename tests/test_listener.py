@@ -375,3 +375,192 @@ def test_main_needs_the_job_log(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["price_listener.py", "--dry-run"])
     with pytest.raises(SystemExit, match="Job Log"):
         pl.main()
+
+
+# ---------------------------------------------------------------- end to end (all faked)
+class E2ENotion(FakeNotion):
+    """FakeNotion whose queue is fed by enqueue (claims) and emptied by mark_done."""
+
+    def query(self, ds, filter_=None, page_size=100, sorts=None, limit=None):
+        if "title" in filter_:
+            return [{"id": "x"}] if filter_["title"]["equals"] in self.claimed else []
+        open_keys = [k for k in self.created if k.startswith("price-check-queue ")
+                     and k not in self.done_keys]
+        return [{"id": k, "properties": {"Run key": {"title": [{"plain_text": k}]}}}
+                for k in open_keys][:limit]
+
+    def update(self, entry_id, props):
+        self.done_keys.add(entry_id)
+
+    def users(self):
+        return {}
+
+
+class E2ESlack:
+    def __init__(self):
+        self.posts = []
+
+    def directory(self):
+        return [("S1", ["Ada"], "ada@upenn.edu")]
+
+    def lookup_email(self, email):
+        return None
+
+    def post(self, channel, text):
+        self.posts.append((channel, text))
+
+
+def pipeline(pages, per_hour=20, price=2.0):
+    """Router + Worker + a real price_check.Checker over fake Notion / Slack / search."""
+    import scraper
+    clock = Clock()
+    notion = E2ENotion(pages)
+    notion.done_keys = set()
+    slack = E2ESlack()
+    searched = []
+
+    def find(row):
+        searched.append(row.id)
+        r = {"title": "LM7805", "url": f"https://shop.com/{row.id}", "snippet": "", "search_rank": 0,
+             **scraper._blank_info(), "cost": price, "currency": "USD", "cost_source": "llm",
+             "supplier": "shop.com", "in_stock": True, "shipping_cost": "Free",
+             "shipping_time": "2 days"}
+        rs = [scraper.apply_qty(r, row.units)]
+        pc.Scorer().score_all(rs, row.part_number, row.units)
+        return rs
+    checker = pc.Checker(CFG, notion, slack, find)
+    settling = pl.Settling(clock)
+    router = pl.Router(CFG, settling, 60, ["db1"])
+    w = pl.Worker(CFG, notion, checker, settling, pl.HourlyLimit(per_hour, clock=clock), clock=clock)
+    return router, w, notion, slack, searched, clock
+
+
+def with_contact(page_):
+    page_["properties"]["Point of contact"] = {"people": [
+        {"id": "u1", "name": "Ada", "person": {"email": "ada@upenn.edu"}}]}
+    return page_
+
+
+def run_until_idle(w, clock, max_steps=1000):
+    for _ in range(max_steps):
+        if w.step() is None:
+            return
+
+
+def test_webhook_to_slack_dm():
+    router, w, notion, slack, searched, clock = pipeline({"p1": with_contact(open_page("p1"))})
+    router.handle(event(pid="p1"))
+    run_until_idle(w, clock)
+    assert searched == []                       # still settling
+    clock.t += 60
+    run_until_idle(w, clock)
+    assert searched == ["p1"]
+    assert notion.created == ["price-check-queue p1", "price-alert p1 1 x10"]
+    assert slack.posts[0][0] == "S1" and "+100%" in slack.posts[0][1]
+    assert notion.done_keys == {"price-check-queue p1"}
+
+
+def test_many_events_for_one_row_mean_one_check():
+    router, w, notion, slack, searched, clock = pipeline({"p1": open_page("p1")})
+    for _ in range(10):                         # created, then edited field by field
+        router.handle(event("page.properties_updated", pid="p1", updated=[]))
+        clock.t += 5
+    clock.t += 60
+    run_until_idle(w, clock)
+    router.handle(event("page.properties_updated", pid="p1", updated=[]))   # edited after the check
+    clock.t += 60
+    run_until_idle(w, clock)
+    assert searched == ["p1"] and notion.created.count("price-check-queue p1") == 1
+
+
+def test_burst_is_rate_limited_and_drains_over_time():
+    pages = {f"p{i}": open_page(f"p{i}") for i in range(100)}
+    router, w, notion, slack, searched, clock = pipeline(pages, per_hour=20)
+    for pid in pages:
+        router.handle(event(pid=pid))
+    clock.t += 60
+    run_until_idle(w, clock)
+    assert len(searched) == 20                  # the first hour's worth
+    assert len([k for k in notion.created if k.startswith("price-check-queue")]) == 100  # all queued
+    for hour in range(4):
+        clock.t += 3600
+        run_until_idle(w, clock)
+    assert sorted(searched) == sorted(pages)    # oldest first, every row exactly once
+
+
+def test_row_completed_later_is_checked_when_complete():
+    pages = {"p1": open_page("p1", part="")}
+    router, w, notion, slack, searched, clock = pipeline(pages)
+    router.handle(event(pid="p1"))              # created empty
+    clock.t += 60
+    run_until_idle(w, clock)
+    assert notion.created == [] and searched == []
+    pages["p1"] = open_page("p1")               # part number filled in
+    router.handle(event("page.properties_updated", pid="p1", updated=[]))
+    clock.t += 60
+    run_until_idle(w, clock)
+    assert searched == ["p1"]
+
+
+# ---------------------------------------------------------------- remaining edges
+def test_oversized_request_is_refused_before_reading_it(server):
+    import http.client
+    url, settling = server
+    conn = http.client.HTTPConnection(url.split("//")[1], timeout=5)
+    conn.putrequest("POST", "/notion/webhook")
+    conn.putheader("Content-Length", str(pl.MAX_BODY_BYTES + 1))
+    conn.endheaders()                           # headers only: the server must not wait for 1 MB
+    resp = conn.getresponse()
+    assert resp.status == 413 and json.loads(resp.read()) == {"error": "too large"}
+    conn.close()
+    assert len(settling) == 0
+
+
+def _main_env(monkeypatch):
+    monkeypatch.setattr(pl, "load_env", lambda *a: None)
+    monkeypatch.setenv("NOTION_TOKEN", "n")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "s")
+    monkeypatch.delenv("NOTION_JOB_LOG_DS_ID", raising=False)
+
+
+def test_main_exits_without_an_llm(monkeypatch):
+    _main_env(monkeypatch)
+
+    def no_llm(*a, **k):
+        raise pl.scraper2.LLMError("no LLM configured")
+    monkeypatch.setattr(pl.scraper2, "LLM", no_llm)
+    monkeypatch.setattr(sys, "argv", ["price_listener.py"])
+    with pytest.raises(SystemExit, match="no LLM configured"):
+        pl.main()
+
+
+def test_main_dry_run_previews_startup_rows(monkeypatch, capsys):
+    _main_env(monkeypatch)
+    monkeypatch.setenv("PORT", "0")
+    workers = []
+
+    class LLM:
+        provider, model = "fake", "m"
+
+        def __init__(self, *a, **k):
+            pass
+
+    class Notion:
+        def __init__(self, token, version):
+            pass
+
+        def data_source(self, ds):
+            return {"parent": {}, "properties": {}}
+
+    calls = []
+    monkeypatch.setattr(pl.scraper2, "LLM", LLM)
+    monkeypatch.setattr(pl.pc, "Notion", Notion)
+    monkeypatch.setattr(pl.pc, "discover", lambda notion, cfg, dry_run=False: calls.append(dry_run) or ["old1"])
+    monkeypatch.setattr(pl.threading, "Thread", lambda target, daemon: workers.append(target.__self__) or
+                        type("T", (), {"start": lambda self: None})())
+    monkeypatch.setattr(pl, "ThreadingHTTPServer", lambda addr, handler: type(
+        "S", (), {"serve_forever": lambda self: None})())
+    monkeypatch.setattr(sys, "argv", ["price_listener.py", "--dry-run"])
+    pl.main()
+    assert calls == [True] and workers[0].preview == ["old1"] and workers[0].dry_run
+    assert "1 row(s) from the last 168 h would be queued" in capsys.readouterr().err

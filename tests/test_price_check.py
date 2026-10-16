@@ -525,3 +525,46 @@ def test_slack_post_failure_does_not_stop_the_run(capsys):
 def test_no_target_and_no_channel_logs_the_alert(capsys):
     checker().check(pc.parse_row(page(contacts=())))
     assert "alert not sent" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- remaining edges
+def test_notion_users_unavailable_falls_back_to_names(capsys):
+    class NoUsers(FakeNotion):
+        def users(self):
+            raise RuntimeError("HTTP 403 restricted_resource")
+    slack = FakeSlack([("S7", ["Ada Lovelace"], None)])
+    row = pc.parse_row(page(contacts=(("u1", "Ada Lovelace", None),)))
+    assert checker(NoUsers(), slack).check(row) == "alerted"
+    assert slack.posts[0][0] == "S7"
+    assert "matching by name" in capsys.readouterr().err
+
+
+def test_mark_done_failure_does_not_stop_the_queue(capsys):
+    class ReadOnly(FakeNotion):
+        def update(self, page_id, props):
+            raise RuntimeError("HTTP 409 conflict")
+    notion = ReadOnly(pages={"p1": page("p1"), "p2": page("p2")})
+    assert checker(notion).drain([("e1", "p1"), ("e2", "p2")]) == {"alerted": 2}
+    assert capsys.readouterr().err.count("couldn't mark queue entry") == 2
+
+
+def test_alert_lists_flags_but_not_estimated_shipping():
+    row = pc.parse_row(page(cost=1.00))
+    link = listing(row.link, 1.50, shipping_cost=None)
+    f = pc.compare(row, scored(link), CFG)
+    f.found["notes"] = ["shipping cost estimated", "search page: lowest listing"]
+    text = pc.format_alert(f)
+    assert "• Flags: search page: lowest listing" in text and "estimated" not in text
+
+
+def test_main_exits_without_an_llm(monkeypatch):
+    monkeypatch.setattr(pc, "load_env", lambda *a: None)
+    monkeypatch.setenv("NOTION_TOKEN", "n")
+    monkeypatch.setattr(pc, "Notion", lambda t, v: FakeNotion(rows=[page()]))
+
+    def no_llm(*a, **k):
+        raise pc.scraper2.LLMError("no LLM configured")
+    monkeypatch.setattr(pc.scraper2, "LLM", no_llm)
+    monkeypatch.setattr(pc.sys, "argv", ["price_check.py", "--all", "--dry-run"])
+    with pytest.raises(SystemExit, match="no LLM configured"):
+        pc.main()
