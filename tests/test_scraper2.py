@@ -172,6 +172,42 @@ def test_snippets_info_maps_rows_by_index():
     assert len(llm.prompts) == 1 and "[2] LM7805 #2" in llm.prompts[0][1]
 
 
+
+# ---------------------------------------------------------------- batching
+def test_batch_sends_several_pages_per_request(monkeypatch):
+    monkeypatch.setattr(s, "_fetch_html", lambda url: PAGE)
+    rs = [result(f"https://site{i}.com/p", f"LM7805 #{i}") for i in range(5)]
+    llm = FakeLLM({"results": [{"index": i, "cost": i + 1} for i in range(3)]})
+    out = s.pages_info(rs, llm, "LM7805", batch=3)
+    assert len(llm.prompts) == 2  # 5 pages in groups of 3 + 2
+    system, prompt = llm.prompts[0]
+    assert '"index": n' in system and "=== [2] ===" in prompt and "=== [3] ===" not in prompt
+    assert [r["url"] for r in out] == [r["url"] for r in rs]  # order kept
+    assert [r["cost"] for r in out] == [1, 2, 3, 1, 2]
+    assert all(r["cost_source"] == "llm" for r in out)
+
+
+def test_batch_page_missing_from_reply_is_flagged(monkeypatch):
+    monkeypatch.setattr(s, "_fetch_html", lambda url: PAGE)
+    rs = [result(f"https://site{i}.com/p") for i in range(3)]
+    out = s.pages_info(rs, FakeLLM({"results": [{"index": 0, "cost": 1}, "junk"]}), "LM7805", 3)
+    assert out[0]["cost"] == 1 and out[1]["cost"] is None
+    assert "no reply for this page" in out[1]["fetch_error"]
+
+
+def test_batch_llm_error_lands_on_every_page_in_it(monkeypatch):
+    monkeypatch.setattr(s, "_fetch_html", lambda url: PAGE)
+    rs = [result(f"https://site{i}.com/p") for i in range(2)]
+    out = s.pages_info(rs, FakeLLM(error="HTTP 429"), "LM7805", 2)
+    assert [r["fetch_error"] for r in out] == ["llm: HTTP 429"] * 2
+
+
+def test_batch_reply_without_results_list(monkeypatch):
+    monkeypatch.setattr(s, "_fetch_html", lambda url: PAGE)
+    rs = [result(f"https://site{i}.com/p") for i in range(2)]
+    out = s.pages_info(rs, FakeLLM({"cost": 5}), "LM7805", 2)
+    assert all(r["cost"] is None and "no reply" in r["fetch_error"] for r in out)
+
 # ---------------------------------------------------------------- qty + ranking
 def test_apply_qty_uses_llm_pack_size():
     r = candidate(0, 5.90, qty=25, pack_size=10)
@@ -316,3 +352,43 @@ def test_requests_are_paced(no_keys, monkeypatch):
     for _ in range(3):
         llm._wait_turn()
     assert slept == [0, 2, 4]
+
+
+# ---------------------------------------------------------------- LLM client edges
+def test_network_errors_are_retried(llm, monkeypatch):
+    queue = [s.requests.ConnectionError("reset"), chat('{"ok": 1}')]
+
+    def post(url, json, timeout, headers):
+        r = queue.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+    monkeypatch.setattr(s.requests, "post", post)
+    assert llm.json("s", "u") == {"ok": 1}
+
+
+def test_unexpected_response_shape(llm, monkeypatch):
+    replies(monkeypatch, FakePost(200, {"error": "weird"}, text="weird"))
+    with pytest.raises(s.LLMError, match="unexpected response"):
+        llm.json("s", "u")
+
+
+def test_ollama_up(monkeypatch):
+    monkeypatch.setattr(s.requests, "get", lambda *a, **k: type("R", (), {"ok": True})())
+    assert s._ollama_up() is True
+
+    def down(*a, **k):
+        raise s.requests.ConnectionError("refused")
+    monkeypatch.setattr(s.requests, "get", down)
+    assert s._ollama_up() is False
+
+
+def test_snippets_info_exits_when_llm_fails():
+    with pytest.raises(SystemExit, match="LLM failed: HTTP 429"):
+        s.snippets_info([result()], FakeLLM(error="HTTP 429"), "LM7805")
+
+
+def test_to_info_product_name_and_listing():
+    info = info_from({"product_name": "  LM7805 Regulator ", "listing_page": True, "pack_size": 20000})
+    assert info["page_title"] == "LM7805 Regulator" and info["listing_page"] is True
+    assert info["pack_size"] == 1  # absurd pack sizes are ignored

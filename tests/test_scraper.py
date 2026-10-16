@@ -188,3 +188,17 @@ def test_zero_price_cannot_top_the_ranking():
     s.score_all(rs, "LM7805", 1)
     top = s.pick_top(rs, 2)
     assert top[0]["cost"] == 0.89 and top[0]["score"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------- .env
+def test_load_env_skips_blanks_comments_and_shell_vars(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text('# comment\nA_KEY="abc"\nexport B_KEY=def\nBLANK_KEY=\nSHELL_KEY=file\n'
+                   '# C_KEY=no\n')
+    for k in ("A_KEY", "B_KEY", "BLANK_KEY", "C_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("SHELL_KEY", "shell")
+    s.load_env(str(env))
+    assert os.environ["A_KEY"] == "abc" and os.environ["B_KEY"] == "def"
+    assert "BLANK_KEY" not in os.environ and "C_KEY" not in os.environ
+    assert os.environ["SHELL_KEY"] == "shell"  # monkeypatch removes A_KEY/B_KEY afterwards

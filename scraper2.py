@@ -42,21 +42,27 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
+import distributors
 from ranking import Scorer, Weights
 from ranking import ship_value as _ship_value
-from scraper import LISTING_URL_RE, BackendError, _blank_info, _fetch_html, _to_float, search
+from scraper import (LISTING_URL_RE, BackendError, _blank_info, _fetch_html, _search_help,
+                     _to_float, load_env, search)
 
 # provider -> (base url, api key env var or None, default model)
 PROVIDERS = {
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai",
                "GEMINI_API_KEY", "gemini-3.1-flash-lite"),
     "groq": ("https://api.groq.com/openai/v1",
-             "GROQ_API_KEY", "meta-llama/llama-4-scout-17b-16e-instruct"),
+             "GROQ_API_KEY", "qwen/qwen3.8-27b"),
     "openrouter": ("https://openrouter.ai/api/v1",
                    "OPENROUTER_API_KEY", "meta-llama/llama-3.3-70b-instruct:free"),
     "ollama": ("http://localhost:11434/v1", None, "llama3.2"),
 }
-PAGE_CHARS = 8000   # page text sent per call (~2k tokens): keeps free-tier TPM happy
+# Pages sent per LLM request (--batch). Fewer, bigger requests save free-tier daily quota;
+# only Gemini's free tier has room for several pages per request (Groq's tokens-per-minute
+# limit is small, and Ollama's default context window would cut the prompt off).
+BATCH_DEFAULT = {"gemini": 5, "groq": 1, "openrouter": 1, "ollama": 1}
+PAGE_CHARS = 8000   # page text sent per page (~2k tokens): keeps free-tier TPM happy
 LD_CHARS = 3000     # JSON-LD sent per call
 
 SYSTEM = """You extract purchasing details for one product listing from scraped web page text.
@@ -230,9 +236,8 @@ def to_info(d, info, source):
     return info
 
 
-def part_info(result, llm, query):
-    """Fetch a result page and have the LLM pull cost / supplier / shipping details."""
-    domain = urlparse(result["url"]).netloc.lower().removeprefix("www.")
+def _read_page(result):
+    """Fetch a result page: (info with fetch_error if it failed, prompt text for the LLM)."""
     info = _blank_info()
     info["listing_page"] = bool(LISTING_URL_RE.search(result["url"]))
     title = ld = text = ""
@@ -243,7 +248,7 @@ def part_info(result, llm, query):
         info["fetch_error"] = str(e)
     except Exception as e:  # one malformed page must not abort the whole thread pool
         info["fetch_error"] = f"parse error: {e!r}"
-    prompt = (f"Searching for: {query}\nURL: {result['url']}\n"
+    prompt = (f"URL: {result['url']}\n"
               f"Search result title: {result['title']}\nSearch snippet: {result['snippet']}\n")
     if title:
         prompt += f"Page heading: {title}\n"
@@ -251,12 +256,62 @@ def part_info(result, llm, query):
         prompt += f"JSON-LD: {ld}\n"
     if text:
         prompt += f"Page text: {text}\n"
-    try:
-        to_info(llm.json(SYSTEM, prompt), info, "llm" if text or ld else "llm snippet")
-    except LLMError as e:
-        info["fetch_error"] = f"{info['fetch_error'] + '; ' if info['fetch_error'] else ''}llm: {e}"
-    info["supplier"] = info["supplier"] or domain
+    info["_source"] = "llm" if text or ld else "llm snippet"
+    return info, prompt
+
+
+def _finish(result, info, reply=None, error=None):
+    """Merge one page's LLM reply (or the LLM error) into its result dict."""
+    source = info.pop("_source")
+    if reply is not None:
+        to_info(reply, info, source)
+    if error:
+        info["fetch_error"] = f"{info['fetch_error'] + '; ' if info['fetch_error'] else ''}llm: {error}"
+    info["supplier"] = info["supplier"] or urlparse(result["url"]).netloc.lower().removeprefix("www.")
     return {**result, **info}
+
+
+BATCH_SYSTEM = SYSTEM.replace(
+    "for one product listing from scraped web page text",
+    "for each of several product listings from scraped web page text") + \
+    ('\nEach listing is marked "=== [n] ===". Return {"results": [ {"index": n, ...those '
+     'keys...}, ... ]} with one entry per listing, never mixing details between listings.')
+
+
+def _ask(results, pages, llm, query):
+    """One LLM request for a group of fetched pages; returns their finished result dicts."""
+    if len(results) == 1:
+        try:
+            return [_finish(results[0], pages[0][0], llm.json(SYSTEM, f"Searching for: {query}\n"
+                                                                     + pages[0][1]))]
+        except LLMError as e:
+            return [_finish(results[0], pages[0][0], error=e)]
+    prompt = f"Searching for: {query}\n\n" + "\n".join(
+        f"=== [{i}] ===\n{text}" for i, (_, text) in enumerate(pages))
+    try:
+        rows = llm.json(BATCH_SYSTEM, prompt).get("results")
+    except LLMError as e:
+        return [_finish(r, info, error=e) for r, (info, _) in zip(results, pages)]
+    by_idx = {row.get("index"): row for row in rows if isinstance(row, dict)} \
+        if isinstance(rows, list) else {}
+    return [_finish(r, info, by_idx[i]) if i in by_idx else
+            _finish(r, info, error="no reply for this page in the batch")
+            for i, (r, (info, _)) in enumerate(zip(results, pages))]
+
+
+def pages_info(results, llm, query, batch=1):
+    """Fetch every result page, then have the LLM read them `batch` pages per request."""
+    with ThreadPoolExecutor(max_workers=min(10, len(results) or 1)) as pool:
+        pages = list(pool.map(_read_page, results))
+    groups = [(results[i:i + batch], pages[i:i + batch]) for i in range(0, len(results), batch)]
+    with ThreadPoolExecutor(max_workers=min(8, len(groups) or 1)) as pool:  # llm paces itself
+        done = pool.map(lambda g: _ask(g[0], g[1], llm, query), groups)
+    return [r for group in done for r in group]
+
+
+def part_info(result, llm, query):
+    """Fetch one result page and have the LLM pull cost / supplier / shipping details."""
+    return pages_info([result], llm, query)[0]
 
 
 def snippets_info(results, llm, query):
@@ -285,10 +340,11 @@ def apply_qty(r, qty):
     """scraper.apply_qty, but with the LLM's pack size instead of a title regex."""
     breaks = sorted(set(r["price_breaks"]))
     r["price_breaks"] = [{"min_qty": q, "price": p} for q, p in breaks]
-    tier = [p for q, p in breaks if q <= qty]
+    units = distributors.order_units(qty, r.get("min_order"), r.get("order_mult"))
+    tier = [p for q, p in breaks if q <= units]
     pack = 1 if tier else r.get("pack_size") or 1
     price = tier[-1] if tier else r["cost"]
-    packs = -(-qty // pack)
+    packs = -(-units // pack)
     r.update(qty=qty, pack_size=pack, packs_needed=packs,
              unit_cost=None, subtotal=None, total=None, enough_stock=None)
     if r["stock"] is not None:
@@ -306,6 +362,49 @@ def apply_qty(r, qty):
     if ship_val is not None:
         r["total"] = round(r["subtotal"] + ship_val, 2)
     return r
+
+
+# ---------------------------------------------------------------- search + rank
+def find(base, qty, llm, scorer=None, pool=30, api_n=10, batch=None, exact=False,
+         no_fetch=False, verbose=False, extra=()):
+    """Search, read and score every candidate for `qty` x `base`.
+
+    `extra` are search-result dicts ({"title", "url", "snippet"}) always read alongside the
+    search hits, e.g. a link someone already chose. Returns (query sent to the search
+    engine, source label, scored results); pick the winners with scorer.pick_top.
+    Raises RuntimeError when web search fails and there is nothing else to rank.
+    """
+    scorer = scorer or Scorer()
+    query = base if exact or "price" in base.lower() else base + " price"
+    variants = () if exact else (f"buy {base}", f"{base} in stock")
+    api, used = distributors.lookup(base, qty, api_n, verbose) if api_n else ([], [])
+    try:
+        source, results = search(query, pool, verbose, variants)
+    except RuntimeError as e:
+        if not (api or extra):
+            raise
+        if verbose:  # the distributor APIs / extra links alone are still worth ranking
+            print(f"web search failed, ranking without it:\n{e}", file=sys.stderr)
+        source, results = "none", []
+    results = distributors.drop_api_sites(results, used)
+    seen = {r["url"] for r in results}
+    results += [{"snippet": "", "search_rank": 0, **r} for r in extra if r["url"] not in seen]
+    source = " + ".join([source] * bool(results) + [f"{n} api" for n in used])
+    if verbose:
+        print(f"[{source}] {len(results)} web + {len(api)} api candidates; extracting with "
+              f"{llm.provider}/{llm.model}...", file=sys.stderr)
+
+    if no_fetch and results:  # no LLM call when only API results are left
+        results = snippets_info(results, llm, base)
+    else:
+        batch = batch or BATCH_DEFAULT.get(llm.provider, 1)
+        if verbose:
+            print(f"[{llm.provider}] {-(-len(results) // batch)} LLM request(s), "
+                  f"{batch} page(s) each", file=sys.stderr)
+        results = pages_info(results, llm, base, batch)
+    results = [apply_qty(r, qty) for r in results + api]
+    scorer.score_all(results, base, qty)
+    return query, source, results
 
 
 # ---------------------------------------------------------------- main
@@ -332,14 +431,23 @@ def main():
     p.add_argument("--model", help="LLM model id (default: provider's free model, or $LLM_MODEL)")
     p.add_argument("--rpm", type=float, default=15,
                    help="max LLM requests per minute (default 15, Gemini's free limit)")
+    p.add_argument("--batch", type=int, metavar="N",
+                   help="pages per LLM request; fewer requests save daily quota "
+                        "(default 5 for gemini, 1 for others)")
     p.add_argument("--weights", metavar="FILE",
                    help="JSON file overriding ranking weights, e.g. {\"out_of_stock\": 2.0} "
                         "(see Weights in ranking.py)")
+    p.add_argument("--api", type=int, default=10, metavar="N",
+                   help="results per distributor API with keys set (Mouser, DigiKey; "
+                        "default 10, 0 = off)")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="log skipped backends, retries and fetch errors to stderr")
     a = p.parse_args()
-    if a.qty < 1 or a.top < 1 or a.pool < a.top or a.rpm <= 0:
-        p.error("need --qty >= 1, --top >= 1, --pool >= --top and --rpm > 0")
+    load_env()
+    if a.qty < 1 or a.top < 1 or a.pool < a.top or a.rpm <= 0 or a.api < 0 or \
+            (a.batch is not None and a.batch < 1):
+        p.error("need --qty >= 1, --top >= 1, --pool >= --top, --rpm > 0, --api >= 0 "
+                "and --batch >= 1")
 
     try:
         llm = LLM(a.provider, a.model, a.rpm, a.verbose)
@@ -350,23 +458,12 @@ def main():
     except (OSError, ValueError) as e:
         p.error(f"--weights: {e}")
     base = " ".join(a.query)
-    query = base if a.exact or "price" in base.lower() else base + " price"
-    variants = () if a.exact else (f"buy {base}", f"{base} in stock")
     try:
-        source, results = search(query, a.pool, a.verbose, variants)
+        query, source, results = find(base, a.qty, llm, scorer, pool=a.pool, api_n=a.api,
+                                      batch=a.batch, exact=a.exact, no_fetch=a.no_fetch,
+                                      verbose=a.verbose)
     except RuntimeError as e:
-        sys.exit(str(e))
-    if a.verbose:
-        print(f"[{source}] {len(results)} candidates; extracting with "
-              f"{llm.provider}/{llm.model}...", file=sys.stderr)
-
-    if a.no_fetch:
-        results = snippets_info(results, llm, base)
-    else:
-        with ThreadPoolExecutor(max_workers=min(8, len(results) or 1)) as pool:
-            results = list(pool.map(lambda r: part_info(r, llm, base), results))
-    results = [apply_qty(r, a.qty) for r in results]
-    scorer.score_all(results, base, a.qty)
+        sys.exit(_search_help(str(e)))
     top = scorer.pick_top(results, a.top, a.rank, a.per_supplier)
     stats = {"candidates": len(results),
              "fetched": sum(not r.get("fetch_error") for r in results),

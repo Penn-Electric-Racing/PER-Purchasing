@@ -44,6 +44,19 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### API keys in `.env`
+
+Put your keys in a `.env` file in the project folder and both scrapers load it
+automatically:
+
+```bash
+cp .env.example .env    # then fill in the keys you have
+```
+
+`.env` is git-ignored. Variables already set in your shell take priority, and
+blank lines in the file are ignored. You can also `export` any of the
+variables below instead.
+
 ### Search API key (recommended)
 
 Both scrapers use the first search source that works:
@@ -58,12 +71,30 @@ Both scrapers use the first search source that works:
 DuckDuckGo works without a key but rate-limits quickly (usually for 15-60
 minutes), so set one of the keys if you search often.
 
+### Mouser and DigiKey API keys (recommended for electronic parts)
+
+Mouser and DigiKey pages are hard to scrape, but both have free APIs that give
+exact price breaks, stock, minimum order and lead time. When keys are set,
+both scrapers add up to `--api` parts (default 10) from each API to the pool,
+and skip scraped pages from that distributor's site.
+
+| API | How to get a key | Environment variables |
+|---|---|---|
+| [Mouser Search API](https://www.mouser.com/api-hub/) | free, ~1,000 calls/day | `MOUSER_API_KEY` |
+| [DigiKey Product Information v4](https://developer.digikey.com) | create an app (Production, Product Information V4), free tier | `DIGIKEY_CLIENT_ID` + `DIGIKEY_CLIENT_SECRET` |
+
+DigiKey uses `DIGIKEY_SITE` (default `US`) and `DIGIKEY_CURRENCY` (default
+`USD`). Neither API reports shipping costs, so shipping is treated as
+unknown unless you set the free-shipping minimum for your country, for
+example `MOUSER_FREE_SHIP_MIN=50` and `DIGIKEY_FREE_SHIP_MIN=100`. Check the
+distributor's site for the current amount.
+
 ### LLM key (only for `scraper2.py`)
 
 | Provider | Free tier | Environment variable | Default model |
 |---|---|---|---|
 | [Google Gemini](https://aistudio.google.com/apikey) | yes, no card | `GEMINI_API_KEY` | `gemini-3.1-flash-lite` |
-| [Groq](https://console.groq.com/keys) | yes, no card | `GROQ_API_KEY` | `meta-llama/llama-4-scout-17b-16e-instruct` |
+| [Groq](https://console.groq.com/keys) | yes, no card | `GROQ_API_KEY` | `qwen/qwen3.8-27b` |
 | [OpenRouter](https://openrouter.ai) | `:free` models | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct:free` |
 | [Ollama](https://ollama.com) (local) | free | none (must be running on `localhost:11434`) | `llama3.2` |
 
@@ -101,6 +132,7 @@ python scraper2.py "LM7805" --no-fetch            # one LLM call over all snippe
 | `--exact` | off | Search the query exactly. By default "price" is added, and "buy …" / "… in stock" searches top up the pool. |
 | `--no-fetch` | off | Don't open the result pages; use only the search titles and snippets. |
 | `--weights FILE` | none | JSON file that overrides ranking weights (see below). |
+| `--api N` | 10 | Parts to take from each distributor API that has keys set. `0` turns the APIs off. |
 | `--json` | off | Print the full results as JSON. |
 | `-v, --verbose` | off | Log skipped search sources, LLM retries and fetch errors to stderr. |
 
@@ -121,7 +153,9 @@ search ──► fetch each page ──► extract fields ──► apply quanti
 ```
 
 1. **Search** (`scraper.search`): gets `--pool` unique URLs from the first
-   search source that works.
+   search source that works. The Mouser and DigiKey APIs (`distributors.py`)
+   are queried too. Their results arrive with all fields filled in, so they
+   skip steps 2 and 3. If web search fails, the API results are still ranked.
 2. **Fetch** (`scraper._fetch_html`): downloads each page (up to 5 MB). PDFs
    and other non-HTML files are skipped. If a site blocks the request, the
    search snippet is used instead.
@@ -138,7 +172,9 @@ search ──► fetch each page ──► extract fields ──► apply quanti
      `[struck-out: …]`, and any JSON-LD and the search snippet are added. The
      LLM is asked for the same fields as a JSON object, and every value is
      type-checked before it is used.
-4. **Quantity** (`apply_qty`): picks the bulk price tier your `--qty` reaches.
+4. **Quantity** (`apply_qty`): rounds `--qty` up to the distributor's minimum
+   order and order multiple (API results only), then picks the bulk price tier
+   that quantity reaches.
    Otherwise it divides by the pack size ("Pack of 10", "30pcs") to get packs
    needed. It then checks stock and applies the free-shipping minimum.
 5. **Score and pick** (`ranking.Scorer`): see below.
@@ -166,7 +202,7 @@ score = (effective_cost / best) × multiplier
 | Ships in more than 2 days | × (1 + 0.02 × (days − 2)), at most × 1.40 | `per_ship_day`, `fast_days`, `ship_day_cap` |
 | Shipping time unknown | × 1.06 | `ship_time_unknown` |
 | Shipping cost unknown | × 1.04 | `ship_cost_unknown` |
-| Where the price came from | json-ld / meta × 1.0, llm × 1.02, page text × 1.05, snippet / llm snippet × 1.15, other × 1.1 | `source`, `unknown_source` |
+| Where the price came from | api / json-ld / meta × 1.0, llm × 1.02, page text × 1.05, snippet / llm snippet × 1.15, other × 1.1 | `source`, `unknown_source` |
 | Search or category page | × 1.12 | `listing_page` |
 | Query words missing | × (1 + 0.6 × fraction missing) | `relevance` |
 | Only a longer part number found (LM317L for LM317) | × 1.08 | `mpn_variant` |
@@ -231,16 +267,119 @@ every extracted field, plus `unit_cost`, `pack_size`, `packs_needed`,
 `subtotal`, `total`, `effective_cost`, `enough_stock`, `ship_days`,
 `relevance`, `mpn_variants`, `notes` and `fetch_error`.
 
+## Purchasing price check (`price_check.py`)
+
+Re-prices rows that PERBot's `/parts` adds to the Purchasing (PEFS) Notion
+database, and DMs the row's **Point of contact** on Slack when the price moved.
+Nothing is added to the Purchasing database, and existing rows aren't touched.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant PERBot as PERBot<br/>(Render)
+    participant Purchasing as Notion<br/>Purchasing DB
+    participant JobLog as Notion<br/>⚙️ Job Log
+    participant GitHub
+    participant Workflow as price-check.yml<br/>(this repo)
+    participant Slack
+
+    User->>PERBot: /parts → "Add to Purchasing"
+    PERBot->>Purchasing: create row
+    PERBot->>JobLog: claim "price-check-queue #lt;row id#gt;"
+    PERBot->>GitHub: POST /repos/…/dispatches<br/>{"event_type": "price-check"}
+    Note over GitHub,Workflow: also starts every 30 min (backstop)
+    GitHub->>Workflow: start run (one at a time)
+    Workflow->>JobLog: read up to 10 queued entries, oldest first
+    loop each queued row
+        Workflow->>Purchasing: read row (part, Quant., Unit cost, link)
+        Workflow->>Workflow: search + Mouser/DigiKey + LLM → price at Quant.
+        alt price moved past the threshold
+            Workflow->>JobLog: claim "price-alert #lt;row#gt; #lt;cost#gt; x#lt;qty#gt;"
+            Workflow->>Slack: DM the Point of contact
+        end
+        Workflow->>JobLog: trash the queue entry
+    end
+```
+
+**How rows get here:** when `/parts` → "Add to Purchasing" creates a row,
+PERBot (`src/partFinder/priceCheck.ts`):
+
+1. claims `price-check-queue <page id>` in its ⚙️ Job Log (its `claimOnce`),
+   which is the queue, and
+2. sends this repo a GitHub `repository_dispatch` (event type `price-check`),
+   which starts `.github/workflows/price-check.yml` right away.
+
+The workflow also runs every 30 minutes as a backstop. Each run
+(`price_check.py --queue`) checks up to `PRICE_CHECK_BATCH` queued rows
+(default 10), oldest first, one at a time, and moves each finished entry to
+Notion's trash. Runs never overlap. A burst of 100 additions is worked through
+10 per run instead of hitting the search and LLM limits at once. If search or
+the LLM is failing (quota, outage), entries stay queued and the run stops after
+3 such rows.
+
+**Which rows are checked:** this season's (`BENBUYS_SEASON`, default `REV12`)
+rows with `Exported?` unchecked and a `Cat. or model no.`, `Quant.` and
+`Unit cost`; queued rows that don't qualify are dropped from the queue.
+
+**The check:** `scraper2.find` searches the part number at that quantity
+(web + Mouser/DigiKey APIs + LLM), always reading the row's
+`Link to product webpage` too. The price at that link is used if it could be
+read, else the best-ranked option, at the price break the quantity reaches.
+Rows written by `/parts` as packs ("Sold in packs of N" in the notes) are
+compared per unit. It alerts when the unit price differs from `Unit cost` by at
+least `PRICE_CHECK_THRESHOLD_PCT` (default 10) and the order total by at least
+`PRICE_CHECK_MIN_DELTA_USD` (default 0).
+
+**Who gets it:** Notion person → Slack user by email, then an unambiguous name
+match (as PERBot's `identity.ts`). No match → `PRICE_CHECK_CHANNEL` if set,
+else the log. Each alert is recorded once in the Job Log as
+`price-alert <row id> <unit cost> x<quant>`, so a row alerts again only after
+its `Unit cost` or `Quant.` changes.
+
+It uses PERBot's environment names: `NOTION_TOKEN` (or `NOTION_API_KEY`),
+`SLACK_BOT_TOKEN`, `BENBUYS_PURCHASING_DS_ID`, `NOTION_JOB_LOG_DS_ID`,
+`NOTION_API_VERSION`, with PERBot's defaults.
+
+### Setting it up
+
+1. **This repo** (Settings → Secrets and variables → Actions): add the secrets
+   the workflow lists (`NOTION_API_KEY`, `SLACK_BOT_TOKEN`, a search key such as
+   `SERPER_API_KEY`, an LLM key, the distributor keys), and optionally the
+   thresholds as variables.
+2. **A GitHub token for PERBot:** a fine-grained personal access token with
+   access to only this repo and **Contents: Read and write** (what
+   `repository_dispatch` needs).
+3. **PERBot's Render service:** set `PRICE_CHECK_QUEUE=true` and
+   `PRICE_CHECK_DISPATCH_TOKEN=<that token>`
+   (`PRICE_CHECK_DISPATCH_REPO` defaults to `pandabear189/PER-Purchase-Testing`).
+   Without the token rows are still queued; the 30-minute schedule picks them up.
+
+### Manual commands
+
+```bash
+python price_check.py --queue --dry-run -v         # preview the queue, send and change nothing
+python price_check.py --enqueue <notion page url>  # queue a row by hand (e.g. one typed in Notion)
+python price_check.py --row <notion page url>      # check one row now
+python price_check.py --all --dry-run -v           # every open row, print alerts only
+```
+
 ## Project layout
 
 ```
 scraper.py         search backends, page fetching, regex/JSON-LD extraction, CLI
 scraper2.py        LLM client + LLM extraction; reuses search from scraper.py
+distributors.py    Mouser + DigiKey API lookups, minimum-order maths
+price_check.py     Purchasing (Notion) price check + Slack alerts; drains PERBot's queue
+.github/workflows/price-check.yml   runs it on PERBot's dispatch + every 30 min
 ranking.py         Weights, Scorer (score_all, pick_top), relevance, ship_days
 tests/
   test_scraper.py    extraction, shipping, fetching and ranking regressions
+  test_search.py     search backends (Brave/Serper/Google/DuckDuckGo), search(), page parsing
+  test_cli.py        scraper.py / scraper2.py / price_check.py command lines end to end
   test_scraper2.py   page cleanup, LLM reply validation, LLM client (faked)
   test_ranking.py    Weights / Scorer / --weights files
+  test_distributors.py  Mouser / DigiKey parsing and ranking (APIs faked)
+  test_price_check.py   row parsing, price comparison, identity, alerts (all faked)
 requirements.txt
 ```
 
@@ -250,12 +389,13 @@ All tests run offline. Network calls and the LLM are faked.
 
 ```bash
 pytest            # or: .venv/bin/python -m pytest tests
+pip install coverage && coverage run -m pytest && coverage report -m   # what's untested
 ```
 
 ## Limitations
 
-- Sites that block scripts (eBay, DigiKey and others) fall back to the search
-  snippet, which is less reliable and is ranked lower because of that.
+- Sites that block scripts (eBay, and DigiKey without an API key) fall back to
+  the search snippet, which is less reliable and is ranked lower because of that.
 - Prices are compared in whatever currency each site shows. Listings in a
   different currency from most others are flagged, not converted.
 - LLM extraction can still get things wrong. Check the listing before buying,

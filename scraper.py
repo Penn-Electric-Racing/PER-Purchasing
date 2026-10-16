@@ -52,6 +52,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+import distributors
 from ranking import Scorer, Weights, _alnum, relevance, ship_days  # noqa: F401
 
 TIMEOUT = 15
@@ -274,8 +275,10 @@ PACK_RES = [
     re.compile(r"\b(?:pack|set|lot|box|bag|case|package)\s(?:of\s)?(\d{1,5})\b", re.I),
     re.compile(r"\(?\b(\d{1,5})\s?[-\s]?(?:pcs|pc|pieces|pack|pk|count|ct|units?)\b\)?", re.I),
 ]
+# The lookbehind skips prices: "$0.89 In stock" is not 89 in stock.
 STOCK_RES = [
-    re.compile(r"\b(\d{1,3}(?:,\d{3})+|\d+)\s(?:in\sstock|available|units?\sin\sstock)\b", re.I),
+    re.compile(r"(?<![\d.,$€£¥])\b(\d{1,3}(?:,\d{3})+|\d+)\s(?:in\sstock|available|units?\sin\sstock)\b",
+               re.I),
     re.compile(r"\b(?:in\sstock|stock|qty\savailable)\W{0,3}(\d{1,3}(?:,\d{3})+|\d+)\b", re.I),
     re.compile(r"\bonly\s(\d+)\sleft\b", re.I),
 ]
@@ -554,11 +557,13 @@ def apply_qty(r, qty):
     """Work out unit cost, packs to buy, order total and stock check for `qty` units."""
     breaks = sorted(set(r["price_breaks"]))
     r["price_breaks"] = [{"min_qty": q, "price": p} for q, p in breaks]
+    # Distributor minimum order / order multiple (API results) can mean buying more.
+    units = distributors.order_units(qty, r.get("min_order"), r.get("order_mult"))
     # Price breaks are per-unit prices keyed by min quantity; use the best tier reached.
-    tier = [p for q, p in breaks if q <= qty]
+    tier = [p for q, p in breaks if q <= units]
     pack = 1 if tier else _pack_size(r["title"])
     price = tier[-1] if tier else r["cost"]
-    packs = -(-qty // pack)
+    packs = -(-units // pack)
     r.update(qty=qty, pack_size=pack, packs_needed=packs,
              unit_cost=None, subtotal=None, total=None, enough_stock=None)
     if r["stock"] is not None:
@@ -586,7 +591,8 @@ def _blank_info():
             "shipping_time": None, "shipping_cost": None, "free_ship_min": None,
             "stock": None, "in_stock": None,
             "price_breaks": [], "price_range": None, "price_count": 0,
-            "listing_page": False, "page_title": None, "fetch_error": None}
+            "listing_page": False, "page_title": None, "fetch_error": None,
+            "min_order": None, "order_mult": None}
 
 
 MAX_PAGE_BYTES = 5_000_000
@@ -697,6 +703,32 @@ def search(query, n=5, verbose=False, variants=()):
     raise RuntimeError("All backends failed: " + json.dumps(errors, indent=2))
 
 
+def load_env(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+    """Set KEY=value lines from a .env file (see .env.example) as environment variables.
+    Blank values, comments and variables already set in the shell are left alone."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        key, sep, value = line.removeprefix("export ").partition("=")
+        key, value = key.strip(), value.strip().strip("'\"")
+        if sep and key and value and not key.startswith("#") and key not in os.environ:
+            os.environ[key] = value
+
+
+def _search_help(msg):
+    """Search failure message, plus advice when DuckDuckGo is rate-limiting."""
+    if "HTTP 202" in msg or "Connection reset" in msg or "challenge" in msg:
+        msg += ("\n\nDuckDuckGo is rate-limiting this network (usually clears in "
+                "15-60 min).\nFor reliable 30-result searches, set a free Brave Search "
+                "API key (Serper needs no card):\n"
+                "  https://serper.dev  ->  export SERPER_API_KEY=...\n"
+                "  https://api.search.brave.com  ->  export BRAVE_API_KEY=...")
+    return msg
+
+
 def main():
     """Command-line entry point: search, scrape, score and print or dump JSON."""
     p = argparse.ArgumentParser(
@@ -720,11 +752,15 @@ def main():
     p.add_argument("--weights", metavar="FILE",
                    help="JSON file overriding ranking weights, e.g. {\"out_of_stock\": 2.0} "
                         "(see Weights in ranking.py)")
+    p.add_argument("--api", type=int, default=10, metavar="N",
+                   help="results per distributor API with keys set (Mouser, DigiKey; "
+                        "default 10, 0 = off)")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="log skipped backends, retries and fetch errors to stderr")
     a = p.parse_args()
-    if a.qty < 1 or a.top < 1 or a.pool < a.top:
-        p.error("need --qty >= 1, --top >= 1 and --pool >= --top")
+    load_env()
+    if a.qty < 1 or a.top < 1 or a.pool < a.top or a.api < 0:
+        p.error("need --qty >= 1, --top >= 1, --pool >= --top and --api >= 0")
 
     try:
         scorer = Scorer(Weights.load(a.weights) if a.weights else None)
@@ -733,19 +769,22 @@ def main():
     base = " ".join(a.query)
     query = base if a.exact or "price" in base.lower() else base + " price"
     variants = () if a.exact else (f"buy {base}", f"{base} in stock")
+    api, used = distributors.lookup(base, a.qty, a.api, a.verbose) if a.api else ([], [])
     try:
         source, results = search(query, a.pool, a.verbose, variants)
     except RuntimeError as e:
         msg = str(e)
-        if "HTTP 202" in msg or "Connection reset" in msg or "challenge" in msg:
-            msg += ("\n\nDuckDuckGo is rate-limiting this network (usually clears in "
-                    "15-60 min).\nFor reliable 30-result searches, set a free Brave Search "
-                    "API key (Serper needs no card):\n"
-                    "  https://serper.dev  ->  export SERPER_API_KEY=...\n"
-                    "  https://api.search.brave.com  ->  export BRAVE_API_KEY=...")
-        sys.exit(msg)
+        if api:  # the distributor APIs alone are still worth ranking
+            if a.verbose:
+                print(f"web search failed, using APIs only:\n{msg}", file=sys.stderr)
+            source, results = "none", []
+        else:
+            sys.exit(_search_help(msg))
+    results = distributors.drop_api_sites(results, used)
+    source = " + ".join([source] * bool(results) + [f"{n} api" for n in used])
     if a.verbose:
-        print(f"[{source}] {len(results)} candidates, fetching...", file=sys.stderr)
+        print(f"[{source}] {len(results)} web + {len(api)} api candidates, fetching...",
+              file=sys.stderr)
 
     if a.no_fetch:
         for r in results:
@@ -756,7 +795,7 @@ def main():
             r.update(info)
     else:
         results = enrich(results)
-    results = [apply_qty(r, a.qty) for r in results]
+    results = [apply_qty(r, a.qty) for r in results + api]
     scorer.score_all(results, base, a.qty)
     top = scorer.pick_top(results, a.top, a.rank, a.per_supplier)
     stats = {"candidates": len(results),

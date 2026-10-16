@@ -32,10 +32,11 @@ class Weights:
     ship_time_unknown: float = 1.06
     ship_cost_unknown: float = 1.04  # on top of adding the median known shipping cost
     # Confidence in where the price came from (scraper.py: json-ld/meta/page text/snippet,
-    # scraper2.py: llm/llm snippet). Unlisted sources get unknown_source.
+    # scraper2.py: llm/llm snippet, both: api = Mouser/DigiKey APIs).
+    # Unlisted sources get unknown_source.
     source: dict = field(default_factory=lambda: {
         "json-ld": 1.0, "meta": 1.0, "page text": 1.05, "snippet": 1.15,
-        "llm": 1.02, "llm snippet": 1.15})
+        "llm": 1.02, "llm snippet": 1.15, "api": 1.0})
     unknown_source: float = 1.1
     listing_page: float = 1.12       # price is the lowest of many listings, may not be this part
     relevance: float = 0.6           # x(1 + 0.6 * fraction of query words missing)
@@ -193,7 +194,12 @@ class Scorer:
 
         ok = [r for r in results if r["subtotal"] is not None]
         # Baseline = cheapest *valid* option, so a wrong-part bargain doesn't skew everyone.
+        # If every listing has a note (e.g. all show a suffixed part number), still leave
+        # out the wrong-part and other-currency ones.
+        wrong = ("part number not in listing", "priced in ")
         valid = [r["effective_cost"] for r in ok if not r["notes"]] or \
+            [r["effective_cost"] for r in ok
+             if not any(n.startswith(wrong) for n in r["notes"])] or \
             [r["effective_cost"] for r in ok]
         best = min(valid, default=0) or 0.01
         for r in ok:
