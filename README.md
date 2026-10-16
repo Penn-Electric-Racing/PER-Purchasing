@@ -96,19 +96,33 @@ to `.env` and fill in the settings below, then
 `python price_check.py --row <notion page url> --dry-run -v` checks one row
 without sending or writing anything.
 
-1. **Deploy** it with a public HTTPS URL. `render.yaml` describes a Render web
-   service; fill in the secrets it lists (PERBot's `NOTION_TOKEN` and
-   `SLACK_BOT_TOKEN`, a search key such as `SERPER_API_KEY`, an LLM key, the
-   distributor keys). Use a paid instance: free ones sleep after 15 minutes
-   without requests, which pauses the worker.
-2. In the Notion integration's settings (PERBot's, the one `NOTION_TOKEN`
-   belongs to) → **Webhooks**, add a subscription to
-   `https://<your host>/notion/webhook` with the events `page.created` and
-   `page.properties_updated`.
-3. Notion sends a verification token, and the listener prints it in its log.
-   Paste it into Notion to verify the subscription, and set it as
-   `NOTION_WEBHOOK_SECRET` (every event's signature is checked against it).
-4. `GET /healthz` shows rows waiting to settle and checks this hour.
+It runs on Render as a web service (`render.yaml`), next to PERBot.
+
+1. **Push** this repo to GitHub (`main`).
+2. **Create the service:** Render → **New → Blueprint** → connect
+   `pandabear189/PER-Purchase-Testing`. Render reads `render.yaml` and sets up
+   `per-price-listener` on the starter plan (about $7/month; a free instance
+   sleeps after 15 minutes idle, which pauses the checks).
+3. **Fill in the keys it asks for:** `NOTION_TOKEN` and `SLACK_BOT_TOKEN`
+   (copy them from PERBot's Render service → Environment), `SERPER_API_KEY`,
+   `GEMINI_API_KEY`, and optionally the Mouser/DigiKey/Groq keys and
+   `PRICE_CHECK_CHANNEL`. Leave `NOTION_WEBHOOK_SECRET` empty for now.
+4. **Check it's up:** `https://per-price-listener.onrender.com/healthz` returns
+   `{"ok": true, ...}`. The service's **Logs** show the startup catch-up.
+5. **Add the Notion webhook:** notion.so/profile/integrations → PERBot's
+   integration (the one `NOTION_TOKEN` belongs to) → **Webhooks** → create a
+   subscription to `https://per-price-listener.onrender.com/notion/webhook`
+   with the events `page.created` and `page.properties_updated`.
+6. **Verify it:** the listener's Logs show "verification token received" and
+   a value starting `secret_`. Paste it into Notion's **Verify** box, then set
+   it as `NOTION_WEBHOOK_SECRET` in Render → Environment (the service restarts).
+   Every event's signature is checked against it.
+7. **Try it:** add a `REV12` Purchasing row with you as Point of contact and a
+   deliberately wrong `Unit cost`. About a minute after your last edit the Logs
+   show it queued and checked, and PERBot DMs you.
+
+Pushes to `main` redeploy automatically. Settings changes go in Render →
+Environment.
 
 PERBot needs no changes: its `/parts` rows arrive as webhook events like any
 other. (Its optional `PRICE_CHECK_QUEUE` hook just queues them a minute sooner.)
