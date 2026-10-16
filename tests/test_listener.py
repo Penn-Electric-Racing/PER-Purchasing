@@ -248,6 +248,17 @@ def test_dry_run_previews_without_writing_or_looping():
     assert w.check_next() is None
 
 
+def test_failed_catch_up_does_not_stop_the_worker(capsys):
+    w, _, _, _ = worker()
+
+    def boom():
+        raise RuntimeError("HTTP 502")
+    w.catch_up = boom
+    w.sleep = lambda t: w.stopped.set()
+    w.run()
+    assert "startup catch-up failed (HTTP 502)" in capsys.readouterr().err
+
+
 def test_run_loop_stops():
     w, _, _, _ = worker()
     sleeps = []
@@ -362,10 +373,14 @@ def test_main_catches_up_then_serves(monkeypatch, capsys):
     monkeypatch.setattr(pl, "ThreadingHTTPServer", Server)
     monkeypatch.setattr(sys, "argv", ["price_listener.py"])
     pl.main()
+    assert served == [("", 0)] and len(started) == 1    # serving without waiting on catch-up
     err = capsys.readouterr().err
-    assert served == [("", 0)] and len(started) == 1
-    assert "startup: 2 row(s) from the last 168 h queued" in err
+    assert "startup:" not in err
     assert "NOTION_WEBHOOK_SECRET not set" in err and "max 20/hour" in err
+    worker = started[0].__self__
+    worker.stopped.set()
+    started[0]()                                        # the worker thread: catch up, then loop
+    assert "startup: 2 row(s) from the last 168 h queued" in capsys.readouterr().err
 
 
 def test_main_needs_the_job_log(monkeypatch):
@@ -562,5 +577,9 @@ def test_main_dry_run_previews_startup_rows(monkeypatch, capsys):
         "S", (), {"serve_forever": lambda self: None})())
     monkeypatch.setattr(sys, "argv", ["price_listener.py", "--dry-run"])
     pl.main()
-    assert calls == [True] and workers[0].preview == ["old1"] and workers[0].dry_run
+    w = workers[0]
+    assert calls == [] and w.dry_run                      # catch-up hasn't run yet
+    w.stopped.set()
+    w.run()
+    assert calls == [True] and w.preview == ["old1"]
     assert "1 row(s) from the last 168 h would be queued" in capsys.readouterr().err

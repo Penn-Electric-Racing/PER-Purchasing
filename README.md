@@ -1,4 +1,170 @@
-# Part price scraper
+# PER Purchasing price check
+
+Watches the Purchasing (PEFS) Notion database and, when a new row's price has
+moved, DMs the person who ordered it on Slack. Rows can come from anywhere:
+PERBot's `/parts`, typed into Notion, or imported. Each new row is re-priced at
+its quantity (web search, Mouser/DigiKey APIs and an LLM reading the product
+pages) and compared with the `Unit cost` in Notion.
+
+```
+Notion row added or edited
+  → webhook → price_listener.py
+  → wait for edits to settle → queue in PERBot's Job Log
+  → worker: search + Mouser/DigiKey + LLM → price at Quant.
+  → price moved past the threshold → Slack DM to the Point of contact
+```
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Purchasing as Notion<br/>Purchasing DB
+    participant Listener as price_listener.py<br/>(Render)
+    participant JobLog as Notion<br/>⚙️ Job Log (queue)
+    participant Slack
+
+    User->>Purchasing: add a row (/parts, or in Notion)
+    Purchasing->>Listener: webhook: page.created / page.properties_updated
+    Note over Listener: wait 60 s after the row's last edit
+    Listener->>Purchasing: read the row
+    alt open and complete (part, Quant., Unit cost)
+        Listener->>JobLog: queue "price-check-queue #lt;row id#gt;" (once per row)
+    end
+    loop worker: one row at a time, at most 20 an hour
+        Listener->>JobLog: oldest queued entry
+        Listener->>Purchasing: read the row
+        Listener->>Listener: search + Mouser/DigiKey + LLM → price at Quant.
+        alt price moved past the threshold
+            Listener->>JobLog: claim "price-alert #lt;row#gt; #lt;cost#gt; x#lt;qty#gt;"
+            Listener->>Slack: DM the Point of contact
+        end
+        Listener->>JobLog: mark the entry done
+    end
+```
+
+## How it works
+
+`price_listener.py` is the app: a small web server that Notion's webhooks call
+when a page is created or edited. Everything else runs from there.
+
+1. **Settle:** a row is read 60 s (`PRICE_LISTENER_SETTLE_SECONDS`) after its
+   *last* event, so a row typed in by hand (created empty, then filled in field
+   by field) is looked at once, complete. Only edits to price-relevant columns
+   count (part number, `Quant.`, `Unit cost`, link, `Season`, `Exported?`,
+   notes), and other databases' events are ignored.
+2. **Queue:** if it's open and complete, it's queued in PERBot's ⚙️ Job Log as
+   `price-check-queue <page id>`, the same entry PERBot's `/parts` writes, so a
+   row is queued once however many events or apps report it.
+3. **Check:** one worker drains the queue one row at a time, at most 20 an
+   hour (`PRICE_LISTENER_MAX_PER_HOUR`) with the LLM paced per minute on top,
+   and marks each entry done (`price-check-done`). A burst of 100 new rows
+   waits its turn instead of hitting the search and LLM limits at once. If
+   search or the LLM is failing (quota, outage), the row stays queued and the
+   worker backs off 10 min, 20 min, ... up to 6 h.
+
+The queue lives in Notion, so a restart loses nothing that was queued. On
+startup the listener also queues complete rows created in the last
+`PRICE_CHECK_LOOKBACK_HOURS` (default a week) that were never queued, which
+covers anything added while it was down.
+
+**Which rows are checked:** this season's (`BENBUYS_SEASON`, default `REV12`)
+rows with `Exported?` unchecked and a `Cat. or model no.`, `Quant.` and
+`Unit cost`; queued rows that don't qualify are dropped from the queue.
+
+**The check:** `scraper2.find` searches the part number at that quantity
+(web + Mouser/DigiKey APIs + LLM), always reading the row's
+`Link to product webpage` too. The price at that link is used if it could be
+read, else the best-ranked option, at the price break the quantity reaches.
+Rows written by `/parts` as packs ("Sold in packs of N" in the notes) are
+compared per unit. It alerts when the unit price differs from `Unit cost` by at
+least `PRICE_CHECK_THRESHOLD_PCT` (default 10) and the order total by at least
+`PRICE_CHECK_MIN_DELTA_USD` (default 0).
+
+**Who gets it:** Notion person → Slack user by email, then an unambiguous name
+match (as PERBot's `identity.ts`). No match → `PRICE_CHECK_CHANNEL` if set,
+else the log. Each alert is recorded once in the Job Log as
+`price-alert <row id> <unit cost> x<quant>`, so a row alerts again only after
+its `Unit cost` or `Quant.` changes.
+
+**Sharing PERBot's tokens:** Notion and Slack let both apps use the same tokens
+at once; their rate limits are shared. A rate-limited call (HTTP 429) waits for
+the `Retry-After` time and tries again, up to 3 times.
+
+## Setup
+
+To run it locally first: `pip install -r requirements.txt`, copy `.env.example`
+to `.env` and fill in the settings below, then
+`python price_check.py --row <notion page url> --dry-run -v` checks one row
+without sending or writing anything.
+
+It runs on Render as a web service (`render.yaml`), next to PERBot.
+
+1. **Push** this repo to GitHub (`main`).
+2. **Create the service:** Render → **New → Blueprint** → connect
+   `pandabear189/PER-Purchase-Testing`. Render reads `render.yaml` and sets up
+   `per-price-listener` on the starter plan (about $7/month; a free instance
+   sleeps after 15 minutes idle, which pauses the checks).
+3. **Fill in the keys it asks for:** `NOTION_TOKEN` and `SLACK_BOT_TOKEN`
+   (copy them from PERBot's Render service → Environment), `SERPER_API_KEY`,
+   `GEMINI_API_KEY`, and optionally the Mouser/DigiKey/Groq keys and
+   `PRICE_CHECK_CHANNEL`. Leave `NOTION_WEBHOOK_SECRET` empty for now.
+4. **Check it's up:** `https://per-price-listener.onrender.com/healthz` returns
+   `{"ok": true, ...}`. The service's **Logs** show the startup catch-up.
+5. **Add the Notion webhook:** notion.so/profile/integrations → PERBot's
+   integration (the one `NOTION_TOKEN` belongs to) → **Webhooks** → create a
+   subscription to `https://per-price-listener.onrender.com/notion/webhook`
+   with the events `page.created` and `page.properties_updated`.
+6. **Verify it:** the listener's Logs show "verification token received" and
+   a value starting `secret_`. Paste it into Notion's **Verify** box, then set
+   it as `NOTION_WEBHOOK_SECRET` in Render → Environment (the service restarts).
+   Every event's signature is checked against it.
+7. **Try it:** add a `REV12` Purchasing row with you as Point of contact and a
+   deliberately wrong `Unit cost`. About a minute after your last edit the Logs
+   show it queued and checked, and PERBot DMs you.
+
+Pushes to `main` redeploy automatically. Settings changes go in Render →
+Environment.
+
+PERBot needs no changes: its `/parts` rows arrive as webhook events like any
+other. (Its optional `PRICE_CHECK_QUEUE` hook just queues them a minute sooner.)
+
+## Settings
+
+Set these on the host (Render → Environment) or in `.env` locally. The names
+match PERBot's, so the same values work in both.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `NOTION_TOKEN` (or `NOTION_API_KEY`) | required | PERBot's Notion integration token |
+| `SLACK_BOT_TOKEN` | required | PERBot's bot token (`chat:write`, `users:read`, `users:read.email`) |
+| `NOTION_WEBHOOK_SECRET` | required | The webhook subscription's verification token |
+| `SERPER_API_KEY` / `BRAVE_API_KEY` | one required | Web search (DuckDuckGo blocks cloud servers) |
+| `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` | one required | LLM that reads product pages |
+| `MOUSER_API_KEY`, `DIGIKEY_CLIENT_ID` + `DIGIKEY_CLIENT_SECRET` | optional | Exact distributor prices and stock |
+| `PRICE_CHECK_THRESHOLD_PCT` | `10` | Alert when the unit price moved at least this much (%) |
+| `PRICE_CHECK_MIN_DELTA_USD` | `0` | ...and the order total moved at least this much ($) |
+| `PRICE_CHECK_CHANNEL` | none | Post here when the Point of contact has no Slack match |
+| `PRICE_LISTENER_SETTLE_SECONDS` | `60` | Wait this long after a row's last edit |
+| `PRICE_LISTENER_MAX_PER_HOUR` | `20` | Rows checked per hour at most |
+| `PRICE_CHECK_LOOKBACK_HOURS` | `168` | On startup, catch up on rows created this recently |
+| `PRICE_CHECK_POOL` | `15` | Search results read per row |
+| `BENBUYS_SEASON` | `REV12` | Only this season's rows are checked |
+| `BENBUYS_PURCHASING_DS_ID`, `NOTION_JOB_LOG_DS_ID`, `NOTION_API_VERSION` | PERBot's | Which databases to use |
+| `PORT` | `8080` | Set by Render |
+
+## Manual commands
+
+```bash
+python price_listener.py --dry-run                 # run the listener, log alerts, write nothing
+python price_check.py --queue --dry-run -v         # one pass: new rows + queue, nothing written
+python price_check.py --enqueue <notion page url>  # queue a row by hand (e.g. one typed in Notion)
+python price_check.py --row <notion page url>      # check one row now
+python price_check.py --all --dry-run -v           # every open row, print alerts only
+```
+
+## Part search (`scraper.py`, `scraper2.py`)
+
+The price check is built on these. They also work on their own as a
+command-line part finder.
 
 Find the best places to buy an electronic part (or anything else sold online).
 Give it a part number and a quantity. It searches the web, reads about 30
@@ -37,14 +203,14 @@ unusual page layouts and wording, such as conditional shipping offers, pack
 sizes and price tables. It is slower, because free LLM tiers limit requests
 per minute.
 
-## Setup
+### Setup
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### API keys in `.env`
+#### API keys in `.env`
 
 Put your keys in a `.env` file in the project folder and both scrapers load it
 automatically:
@@ -57,7 +223,7 @@ cp .env.example .env    # then fill in the keys you have
 blank lines in the file are ignored. You can also `export` any of the
 variables below instead.
 
-### Search API key (recommended)
+#### Search API key (recommended)
 
 Both scrapers use the first search source that works:
 
@@ -71,7 +237,7 @@ Both scrapers use the first search source that works:
 DuckDuckGo works without a key but rate-limits quickly (usually for 15-60
 minutes), so set one of the keys if you search often.
 
-### Mouser and DigiKey API keys (recommended for electronic parts)
+#### Mouser and DigiKey API keys (recommended for electronic parts)
 
 Mouser and DigiKey pages are hard to scrape, but both have free APIs that give
 exact price breaks, stock, minimum order and lead time. When keys are set,
@@ -89,7 +255,7 @@ unknown unless you set the free-shipping minimum for your country, for
 example `MOUSER_FREE_SHIP_MIN=50` and `DIGIKEY_FREE_SHIP_MIN=100`. Check the
 distributor's site for the current amount.
 
-### LLM key (only for `scraper2.py`)
+#### LLM key (only for `scraper2.py`)
 
 | Provider | Free tier | Environment variable | Default model |
 |---|---|---|---|
@@ -103,7 +269,7 @@ choose a different provider with `--provider`, and a different model with
 `--model` or `LLM_MODEL=...`. If a provider says the default model doesn't
 exist (free model names change often), pass a current one with `--model`.
 
-## Usage
+### Usage
 
 ```bash
 python scraper.py "LM7805 voltage regulator"      # best 5 for 1 unit
@@ -120,7 +286,7 @@ python scraper2.py "LM7805" --provider groq --rpm 30
 python scraper2.py "LM7805" --no-fetch            # one LLM call over all snippets
 ```
 
-### Options (both scrapers)
+#### Options (both scrapers)
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -144,7 +310,7 @@ python scraper2.py "LM7805" --no-fetch            # one LLM call over all snippe
 | `--model` | provider default | LLM model ID (or set `LLM_MODEL`). |
 | `--rpm N` | 15 | Maximum LLM requests per minute, to stay inside free-tier limits. 30 pages at 15 rpm takes about 2 minutes. |
 
-## How it works
+### How it works
 
 ```
 search ──► fetch each page ──► extract fields ──► apply quantity ──► score ──► pick top N
@@ -179,7 +345,7 @@ search ──► fetch each page ──► extract fields ──► apply quanti
    needed. It then checks stock and applies the free-shipping minimum.
 5. **Score and pick** (`ranking.Scorer`): see below.
 
-## Ranking
+### Ranking
 
 Lower is better. **1.00** means the cheapest valid option with no drawbacks.
 
@@ -224,7 +390,7 @@ groups, and each group comes ahead of the next regardless of score:
 Within a group they are sorted by score (or by `effective_cost` with
 `--rank cheapest`), with at most `--per-supplier` options from one supplier.
 
-### Changing the weights
+#### Changing the weights
 
 Every number above is a field of the `Weights` dataclass in `ranking.py`.
 There are three ways to change them:
@@ -250,7 +416,7 @@ python scraper.py "LM7805" --weights w.json
 `source` entries are merged with the defaults. Any name the file doesn't
 recognise, such as a typo, stops the run with an error.
 
-## JSON output
+### JSON output
 
 `--json` prints:
 
@@ -267,134 +433,25 @@ every extracted field, plus `unit_cost`, `pack_size`, `packs_needed`,
 `subtotal`, `total`, `effective_cost`, `enough_stock`, `ship_days`,
 `relevance`, `mpn_variants`, `notes` and `fetch_error`.
 
-## Purchasing price check (`price_listener.py`, `price_check.py`)
-
-Re-prices new rows in the Purchasing (PEFS) Notion database as they're added,
-however they were added (PERBot's `/parts`, typed into Notion, imported), and
-DMs the row's **Point of contact** on Slack when the price moved. No column is
-added to the database, and rows created before it was set up are left alone.
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant Purchasing as Notion<br/>Purchasing DB
-    participant Listener as price_listener.py<br/>(Render)
-    participant JobLog as Notion<br/>⚙️ Job Log (queue)
-    participant Slack
-
-    User->>Purchasing: add a row (/parts, or in Notion)
-    Purchasing->>Listener: webhook: page.created / page.properties_updated
-    Note over Listener: wait 60 s after the row's last edit
-    Listener->>Purchasing: read the row
-    alt open and complete (part, Quant., Unit cost)
-        Listener->>JobLog: queue "price-check-queue #lt;row id#gt;" (once per row)
-    end
-    loop worker: one row at a time, at most 20 an hour
-        Listener->>JobLog: oldest queued entry
-        Listener->>Purchasing: read the row
-        Listener->>Listener: search + Mouser/DigiKey + LLM → price at Quant.
-        alt price moved past the threshold
-            Listener->>JobLog: claim "price-alert #lt;row#gt; #lt;cost#gt; x#lt;qty#gt;"
-            Listener->>Slack: DM the Point of contact
-        end
-        Listener->>JobLog: mark the entry done
-    end
-```
-
-**How it works:** `price_listener.py` is a small web server that Notion's
-webhooks call when a page is created or edited.
-
-1. **Settle:** a row is read 60 s (`PRICE_LISTENER_SETTLE_SECONDS`) after its
-   *last* event, so a row typed in by hand (created empty, then filled in field
-   by field) is looked at once, complete. Only edits to price-relevant columns
-   count (part number, `Quant.`, `Unit cost`, link, `Season`, `Exported?`,
-   notes), and other databases' events are ignored.
-2. **Queue:** if it's open and complete, it's queued in PERBot's ⚙️ Job Log as
-   `price-check-queue <page id>`, the same entry PERBot's `/parts` writes, so a
-   row is queued once however many events or apps report it.
-3. **Check:** one worker drains the queue one row at a time, at most 20 an
-   hour (`PRICE_LISTENER_MAX_PER_HOUR`) with the LLM paced per minute on top,
-   and marks each entry done (`price-check-done`). A burst of 100 new rows
-   waits its turn instead of hitting the search and LLM limits at once. If
-   search or the LLM is failing (quota, outage), the row stays queued and the
-   worker backs off 10 min, 20 min, ... up to 6 h.
-
-The queue lives in Notion, so a restart loses nothing that was queued. On
-startup the listener also queues complete rows created in the last
-`PRICE_CHECK_LOOKBACK_HOURS` (default a week) that were never queued, which
-covers anything added while it was down.
-
-**Which rows are checked:** this season's (`BENBUYS_SEASON`, default `REV12`)
-rows with `Exported?` unchecked and a `Cat. or model no.`, `Quant.` and
-`Unit cost`; queued rows that don't qualify are dropped from the queue.
-
-**The check:** `scraper2.find` searches the part number at that quantity
-(web + Mouser/DigiKey APIs + LLM), always reading the row's
-`Link to product webpage` too. The price at that link is used if it could be
-read, else the best-ranked option, at the price break the quantity reaches.
-Rows written by `/parts` as packs ("Sold in packs of N" in the notes) are
-compared per unit. It alerts when the unit price differs from `Unit cost` by at
-least `PRICE_CHECK_THRESHOLD_PCT` (default 10) and the order total by at least
-`PRICE_CHECK_MIN_DELTA_USD` (default 0).
-
-**Who gets it:** Notion person → Slack user by email, then an unambiguous name
-match (as PERBot's `identity.ts`). No match → `PRICE_CHECK_CHANNEL` if set,
-else the log. Each alert is recorded once in the Job Log as
-`price-alert <row id> <unit cost> x<quant>`, so a row alerts again only after
-its `Unit cost` or `Quant.` changes.
-
-It uses PERBot's environment names: `NOTION_TOKEN` (or `NOTION_API_KEY`),
-`SLACK_BOT_TOKEN`, `BENBUYS_PURCHASING_DS_ID`, `NOTION_JOB_LOG_DS_ID`,
-`NOTION_API_VERSION`, with PERBot's defaults.
-
-### Setting it up
-
-1. **Deploy** it with a public HTTPS URL. `render.yaml` describes a Render web
-   service; fill in the secrets it lists (PERBot's `NOTION_TOKEN` and
-   `SLACK_BOT_TOKEN`, a search key such as `SERPER_API_KEY`, an LLM key, the
-   distributor keys). Use a paid instance: free ones sleep after 15 minutes
-   without requests, which pauses the worker.
-2. In the Notion integration's settings (PERBot's, the one `NOTION_TOKEN`
-   belongs to) → **Webhooks**, add a subscription to
-   `https://<your host>/notion/webhook` with the events `page.created` and
-   `page.properties_updated`.
-3. Notion sends a verification token, and the listener prints it in its log.
-   Paste it into Notion to verify the subscription, and set it as
-   `NOTION_WEBHOOK_SECRET` (every event's signature is checked against it).
-4. `GET /healthz` shows rows waiting to settle and checks this hour.
-
-PERBot needs no changes: its `/parts` rows arrive as webhook events like any
-other. (Its optional `PRICE_CHECK_QUEUE` hook just queues them a minute sooner.)
-
-### Manual commands
-
-```bash
-python price_listener.py --dry-run                 # run the listener, log alerts, write nothing
-python price_check.py --queue --dry-run -v         # one pass: new rows + queue, nothing written
-python price_check.py --enqueue <notion page url>  # queue a row by hand (e.g. one typed in Notion)
-python price_check.py --row <notion page url>      # check one row now
-python price_check.py --all --dry-run -v           # every open row, print alerts only
-```
-
 ## Project layout
 
 ```
-scraper.py         search backends, page fetching, regex/JSON-LD extraction, CLI
-scraper2.py        LLM client + LLM extraction; reuses search from scraper.py
-distributors.py    Mouser + DigiKey API lookups, minimum-order maths
-price_check.py     Purchasing (Notion) price check + Slack alerts; drains PERBot's queue
-price_listener.py  Notion webhook server: settle -> Job Log queue -> rate-limited checks
+price_listener.py  the app: Notion webhook server -> settle -> Job Log queue -> checks
+price_check.py     the check: compare with Unit cost, Slack DM, Job Log queue helpers, CLI
 render.yaml        Render web service for the listener
+scraper2.py        part search with LLM page reading (find()), LLM client
+scraper.py         search backends, page fetching, regex/JSON-LD extraction, CLI
+distributors.py    Mouser + DigiKey API lookups, minimum-order maths
 ranking.py         Weights, Scorer (score_all, pick_top), relevance, ship_days
 tests/
+  test_listener.py      webhook signature/routing, settling, rate limit, worker, end to end
+  test_price_check.py   row parsing, price comparison, identity, alerts (all faked)
   test_scraper.py    extraction, shipping, fetching and ranking regressions
   test_search.py     search backends (Brave/Serper/Google/DuckDuckGo), search(), page parsing
   test_cli.py        scraper.py / scraper2.py / price_check.py command lines end to end
   test_scraper2.py   page cleanup, LLM reply validation, LLM client (faked)
   test_ranking.py    Weights / Scorer / --weights files
   test_distributors.py  Mouser / DigiKey parsing and ranking (APIs faked)
-  test_price_check.py   row parsing, price comparison, identity, alerts (all faked)
-  test_listener.py      webhook signature/routing, settling, rate limit, worker, HTTP
 requirements.txt
 ```
 

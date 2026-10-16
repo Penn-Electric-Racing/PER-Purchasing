@@ -51,6 +51,7 @@ import argparse
 import os
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -65,6 +66,24 @@ from scraper import _same_url, load_env
 NOTION_API = "https://api.notion.com/v1"
 SLACK_API = "https://slack.com/api"
 TIMEOUT = 30
+# Notion and Slack rate limits are shared with PERBot (same tokens). A 429 waits for
+# Retry-After (capped) and tries again, so an alert isn't lost to a busy moment.
+RATE_LIMIT_RETRIES = 3
+MAX_RETRY_WAIT = 30
+
+
+def _send(fn, *args, **kw):
+    """Make an HTTP call, retrying HTTP 429 after its Retry-After (seconds, capped)."""
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        r = fn(*args, **kw)
+        if r.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+            return r
+        try:
+            wait = float(r.headers.get("Retry-After") or 2 ** attempt)
+        except ValueError:
+            wait = 2 ** attempt
+        print(f"rate limited, retrying in {min(wait, MAX_RETRY_WAIT):g}s", file=sys.stderr)
+        time.sleep(min(wait, MAX_RETRY_WAIT))
 
 # PERBot's defaults (PERBot/src/config.ts), so both apps point at the same databases.
 DEFAULT_PURCHASING_DS = "39e560bc-c039-83db-9f16-076cb18f7d7b"
@@ -146,8 +165,8 @@ class Notion:
                         "Content-Type": "application/json"}
 
     def _call(self, method, path, body=None):
-        r = requests.request(method, NOTION_API + path, headers=self.headers, json=body,
-                             timeout=TIMEOUT)
+        r = _send(requests.request, method, NOTION_API + path, headers=self.headers, json=body,
+                  timeout=TIMEOUT)
         if r.status_code != 200:
             raise RuntimeError(f"Notion {method} {path}: HTTP {r.status_code} {r.text[:300]}")
         return r.json()
@@ -453,7 +472,7 @@ class Slack:
     def _call(self, method, http="post", **params):
         fn = requests.post if http == "post" else requests.get
         kw = {"json": params} if http == "post" else {"params": params}
-        r = fn(f"{SLACK_API}/{method}", headers=self.headers, timeout=TIMEOUT, **kw)
+        r = _send(fn, f"{SLACK_API}/{method}", headers=self.headers, timeout=TIMEOUT, **kw)
         data = r.json()
         if not data.get("ok"):
             raise RuntimeError(f"Slack {method}: {data.get('error', r.status_code)}")

@@ -19,8 +19,9 @@ source:
      off 10 min, 20 min, ... up to 6 h.
 
 The queue lives in Notion, so a restart loses nothing that was queued. On startup the
-listener also queues rows created in the last PRICE_CHECK_LOOKBACK_HOURS that were never
-queued (price_check.discover), which covers events missed while it was down.
+worker first queues rows created in the last PRICE_CHECK_LOOKBACK_HOURS that were never
+queued (price_check.discover), which covers events missed while it was down; the web
+server is already answering by then, so Render's deploy health check doesn't wait on it.
 
 Setup (once):
   1. Deploy with a public HTTPS URL (render.yaml: a Render web service).
@@ -175,6 +176,7 @@ class Worker:
         self.next_poll = 0.0       # look at the queue now (startup backlog, PERBot's entries)
         self.backoff_until = 0.0
         self.failures = 0
+        self.catch_up = None       # startup: () -> page ids queued (price_check.discover)
         self.preview = []          # dry run: rows that would have been queued...
         self.seen = set()          # ...and rows already checked (nothing is marked done)
 
@@ -236,6 +238,16 @@ class Worker:
         return self.check_next()
 
     def run(self):
+        if self.catch_up:  # here rather than before serving, so the port opens right away
+            try:
+                found = self.catch_up()
+            except RuntimeError as e:
+                found = []
+                log(f"startup catch-up failed ({e}); new events are still handled")
+            if self.dry_run:
+                self.preview += found
+            log(f"startup: {len(found)} row(s) from the last {self.cfg.lookback_hours:g} h "
+                f"{'would be ' if self.dry_run else ''}queued")
         while not self.stopped.is_set():
             if self.step() is None:
                 self.sleep(2)
@@ -318,12 +330,8 @@ def main():
     checker = pc.Checker(cfg, notion, slack, pc.make_find(llm, cfg, a.verbose), a.dry_run, a.verbose)
     worker = Worker(cfg, notion, checker, settling, HourlyLimit(per_hour), dry_run=a.dry_run)
 
-    # Catch up on rows added while the listener wasn't running.
-    found = pc.discover(notion, cfg, dry_run=a.dry_run)
-    if a.dry_run:
-        worker.preview += found
-    log(f"startup: {len(found)} row(s) from the last {cfg.lookback_hours:g} h "
-        f"{'would be ' if a.dry_run else ''}queued")
+    # Catch up on rows added while the listener wasn't running (in the worker thread).
+    worker.catch_up = lambda: pc.discover(notion, cfg, dry_run=a.dry_run)
     threading.Thread(target=worker.run, daemon=True).start()
 
     def status():
