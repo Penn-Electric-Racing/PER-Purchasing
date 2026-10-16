@@ -53,7 +53,7 @@ class FakeNotion:
 
     def __init__(self, claimed=(), rows=(), entries=(), pages=None):
         self.claimed, self.created, self.rows, self.queries = set(claimed), [], list(rows), []
-        self.entries, self.pages, self.trashed = list(entries), pages or {}, []
+        self.entries, self.pages, self.done = list(entries), pages or {}, []
 
     def query(self, ds, filter_=None, page_size=100, sorts=None, limit=None):
         if "title" in filter_:  # Job Log claim
@@ -62,7 +62,7 @@ class FakeNotion:
         if "rich_text" in filter_:  # queue entries
             return [{"id": eid, "properties": {"Run key": {"title": [{"plain_text": key}]}}}
                     for eid, key in self.entries][:limit]
-        return self.rows[:limit]
+        return self.rows[:limit]  # open rows / discovery
 
     def create(self, ds, props):
         self.created.append(props["Run key"]["title"][0]["text"]["content"])
@@ -75,8 +75,9 @@ class FakeNotion:
             raise page_
         return page_
 
-    def trash(self, page_id):
-        self.trashed.append(page_id)
+    def update(self, page_id, props):
+        assert props == {"Job": {"rich_text": [{"text": {"content": "price-check-done"}}]}}
+        self.done.append(page_id)
 
     def users(self):
         return {}
@@ -313,11 +314,36 @@ def test_queue_needs_the_job_log():
         pc.queued(FakeNotion(), pc.Config("n", "s", job_log_ds=""))
 
 
-def test_drain_trashes_finished_entries():
+def test_drain_marks_finished_entries_done():
     notion = FakeNotion(pages={"p1": page("p1"), "p2": page("p2", exported=True)})
     counts = checker(notion).drain([("e1", "p1"), ("e2", "p2"), ("e3", "gone")])
     assert counts == {"alerted": 1, "skipped": 1, "gone": 1}
-    assert notion.trashed == ["e1", "e2", "e3"]
+    assert notion.done == ["e1", "e2", "e3"]
+
+
+def test_drain_preview_entries_are_not_marked():
+    notion = FakeNotion(pages={"p1": page("p1")})
+    assert checker(notion).drain([(None, "p1")]) == {"alerted": 1} and notion.done == []
+
+
+# ---------------------------------------------------------------- discovery
+def test_discover_queues_new_complete_rows_once():
+    notion = FakeNotion(rows=[page("new1"), page("new2")], claimed=["price-check-queue new2"])
+    now = pc.datetime(2026, 10, 15, 12, tzinfo=pc.timezone.utc)
+    assert pc.discover(notion, CFG, now) == ["new1"]          # new2: PERBot queued it already
+    assert notion.created == ["price-check-queue new1"]
+    filter_, sorts, limit = notion.queries[0]
+    assert {"timestamp": "created_time",
+            "created_time": {"on_or_after": "2026-10-08T12:00:00+00:00"}} in filter_["and"]
+    assert {"property": "Cat. or model no.", "rich_text": {"is_not_empty": True}} in filter_["and"]
+    assert {"property": "Exported?", "checkbox": {"equals": False}} in filter_["and"]
+    assert sorts == [{"timestamp": "created_time", "direction": "ascending"}]
+
+
+def test_discover_dry_run_and_off():
+    notion = FakeNotion(rows=[page("new1")])
+    assert pc.discover(notion, CFG, dry_run=True) == ["new1"] and notion.created == []
+    assert pc.discover(notion, pc.Config("n", "s", lookback_hours=0)) == []
 
 
 def test_drain_keeps_failures_queued_and_stops_on_outage():
@@ -325,19 +351,19 @@ def test_drain_keeps_failures_queued_and_stops_on_outage():
     notion = FakeNotion(pages=pages)
     outage = lambda row: scored(listing(row.link, None, fetch_error="llm: HTTP 429"))  # noqa: E731
     counts = checker(notion, find=outage).drain([(f"e{i}", f"p{i}") for i in range(5)])
-    assert counts == {"retry": 3} and notion.trashed == []
+    assert counts == {"retry": 3} and notion.done == []
 
 
 def test_drain_unreadable_page_is_retried():
     notion = FakeNotion(pages={"p1": RuntimeError("HTTP 502"), "p2": page("p2")})
     assert checker(notion).drain([("e1", "p1"), ("e2", "p2")]) == {"retry": 1, "alerted": 1}
-    assert notion.trashed == ["e2"]
+    assert notion.done == ["e2"]
 
 
 def test_drain_dry_run_leaves_the_queue():
     notion = FakeNotion(pages={"p1": page("p1")})
     checker(notion, dry_run=True).drain([("e1", "p1")])
-    assert notion.trashed == [] and notion.created == []
+    assert notion.done == [] and notion.created == []
 
 
 # ---------------------------------------------------------------- config
@@ -410,12 +436,12 @@ def test_notion_other_calls(monkeypatch):
     assert n.data_source("ds")["parent"] == {"database_id": "db"}
     n.page("p")
     n.create("ds", {"Run key": 1})
-    n.trash("e")
+    n.update("e", {"Job": 1})
     assert n.users() == {"u1": "a@x"}
     assert [(m, u.split("/v1")[1]) for m, u, _, _ in calls] == [
         ("GET", "/data_sources/ds"), ("GET", "/pages/p"), ("POST", "/pages"),
         ("PATCH", "/pages/e"), ("GET", "/users?page_size=100")]
-    assert calls[3][2] == {"in_trash": True}
+    assert calls[3][2] == {"properties": {"Job": 1}}
     assert calls[2][2]["parent"] == {"type": "data_source_id", "data_source_id": "ds"}
 
 

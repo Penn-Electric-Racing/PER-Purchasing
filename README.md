@@ -269,26 +269,33 @@ every extracted field, plus `unit_cost`, `pack_size`, `packs_needed`,
 
 ## Purchasing price check (`price_check.py`)
 
-Re-prices rows that PERBot's `/parts` adds to the Purchasing (PEFS) Notion
-database, and DMs the row's **Point of contact** on Slack when the price moved.
-Nothing is added to the Purchasing database, and existing rows aren't touched.
+Re-prices new rows in the Purchasing (PEFS) Notion database, however they were
+added (PERBot's `/parts`, typed into Notion, imported), and DMs the row's
+**Point of contact** on Slack when the price moved. No column is added to the
+database, and rows created before the check was set up are left alone.
 
 ```mermaid
 sequenceDiagram
     actor User
     participant PERBot as PERBot<br/>(Render)
     participant Purchasing as Notion<br/>Purchasing DB
-    participant JobLog as Notion<br/>⚙️ Job Log
+    participant JobLog as Notion<br/>⚙️ Job Log (queue)
     participant GitHub
     participant Workflow as price-check.yml<br/>(this repo)
     participant Slack
 
-    User->>PERBot: /parts → "Add to Purchasing"
-    PERBot->>Purchasing: create row
-    PERBot->>JobLog: claim "price-check-queue #lt;row id#gt;"
-    PERBot->>GitHub: POST /repos/…/dispatches<br/>{"event_type": "price-check"}
-    Note over GitHub,Workflow: also starts every 30 min (backstop)
+    alt added with /parts
+        User->>PERBot: "Add to Purchasing"
+        PERBot->>Purchasing: create row
+        PERBot->>JobLog: queue "price-check-queue #lt;row id#gt;"
+        PERBot->>GitHub: repository_dispatch "price-check" (start a run now)
+    else added in Notion directly
+        User->>Purchasing: create row
+    end
+    Note over GitHub,Workflow: a run starts on the dispatch or every 30 min
     GitHub->>Workflow: start run (one at a time)
+    Workflow->>Purchasing: new complete rows from the last 7 days?
+    Workflow->>JobLog: queue the ones never queued
     Workflow->>JobLog: read up to 10 queued entries, oldest first
     loop each queued row
         Workflow->>Purchasing: read row (part, Quant., Unit cost, link)
@@ -297,25 +304,31 @@ sequenceDiagram
             Workflow->>JobLog: claim "price-alert #lt;row#gt; #lt;cost#gt; x#lt;qty#gt;"
             Workflow->>Slack: DM the Point of contact
         end
-        Workflow->>JobLog: trash the queue entry
+        Workflow->>JobLog: mark the entry done
     end
 ```
 
-**How rows get here:** when `/parts` → "Add to Purchasing" creates a row,
-PERBot (`src/partFinder/priceCheck.ts`):
+**How rows get queued:** the queue is PERBot's ⚙️ Job Log, one
+`price-check-queue <page id>` entry per row. Rows get there two ways, and the
+shared key means a row is never queued twice:
 
-1. claims `price-check-queue <page id>` in its ⚙️ Job Log (its `claimOnce`),
-   which is the queue, and
-2. sends this repo a GitHub `repository_dispatch` (event type `price-check`),
-   which starts `.github/workflows/price-check.yml` right away.
+- **Every run** of `.github/workflows/price-check.yml` (every 30 minutes) first
+  looks for open, complete rows created in the last `PRICE_CHECK_LOOKBACK_HOURS`
+  (default 168, a week) and queues any that were never queued. This catches
+  rows added in Notion directly. A row typed in by hand is queued once it has a
+  part number, `Quant.` and `Unit cost`.
+- **PERBot's `/parts`** "Add to Purchasing" queues its row straight away
+  (`src/partFinder/priceCheck.ts`) and sends this repo a GitHub
+  `repository_dispatch`, which starts a run immediately instead of waiting for
+  the schedule.
 
-The workflow also runs every 30 minutes as a backstop. Each run
-(`price_check.py --queue`) checks up to `PRICE_CHECK_BATCH` queued rows
-(default 10), oldest first, one at a time, and moves each finished entry to
-Notion's trash. Runs never overlap. A burst of 100 additions is worked through
-10 per run instead of hitting the search and LLM limits at once. If search or
-the LLM is failing (quota, outage), entries stay queued and the run stops after
-3 such rows.
+Each run (`price_check.py --queue`) then checks up to `PRICE_CHECK_BATCH`
+queued rows (default 10), oldest first, one at a time, and marks each entry
+done (its Job becomes `price-check-done`; the entry stays as the record that
+the row was seen). Runs never overlap. A burst of 100 new rows is worked
+through 10 per run instead of hitting the search and LLM limits at once. If
+search or the LLM is failing (quota, outage), entries stay queued and the run
+stops after 3 such rows.
 
 **Which rows are checked:** this season's (`BENBUYS_SEASON`, default `REV12`)
 rows with `Exported?` unchecked and a `Cat. or model no.`, `Quant.` and
@@ -352,12 +365,12 @@ It uses PERBot's environment names: `NOTION_TOKEN` (or `NOTION_API_KEY`),
 3. **PERBot's Render service:** set `PRICE_CHECK_QUEUE=true` and
    `PRICE_CHECK_DISPATCH_TOKEN=<that token>`
    (`PRICE_CHECK_DISPATCH_REPO` defaults to `pandabear189/PER-Purchase-Testing`).
-   Without the token rows are still queued; the 30-minute schedule picks them up.
+   Without these, `/parts` rows are still found by the 30-minute run, just later.
 
 ### Manual commands
 
 ```bash
-python price_check.py --queue --dry-run -v         # preview the queue, send and change nothing
+python price_check.py --queue --dry-run -v         # preview: new rows + queue, nothing sent or written
 python price_check.py --enqueue <notion page url>  # queue a row by hand (e.g. one typed in Notion)
 python price_check.py --row <notion page url>      # check one row now
 python price_check.py --all --dry-run -v           # every open row, print alerts only
@@ -370,7 +383,7 @@ scraper.py         search backends, page fetching, regex/JSON-LD extraction, CLI
 scraper2.py        LLM client + LLM extraction; reuses search from scraper.py
 distributors.py    Mouser + DigiKey API lookups, minimum-order maths
 price_check.py     Purchasing (Notion) price check + Slack alerts; drains PERBot's queue
-.github/workflows/price-check.yml   runs it on PERBot's dispatch + every 30 min
+.github/workflows/price-check.yml   runs it every 30 min + on PERBot's dispatch
 ranking.py         Weights, Scorer (score_all, pick_top), relevance, ship_days
 tests/
   test_scraper.py    extraction, shipping, fetching and ranking regressions

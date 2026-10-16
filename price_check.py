@@ -12,13 +12,20 @@ product link, and compares the unit price found at that quantity with the row's 
   alert when  |found - Unit cost| / Unit cost >= PRICE_CHECK_THRESHOLD_PCT
          and  |found - Unit cost| x Quant. >= PRICE_CHECK_MIN_DELTA_USD
 
-Which rows: a queue in PERBot's Job Log. When PERBot's /parts "Add to Purchasing" creates a
-row it claims "price-check-queue <page id>" there (its claimOnce) and sends this repo a
-GitHub repository_dispatch, which starts .github/workflows/price-check.yml; the workflow
-also runs every 30 min as a backstop. Each run (--queue) checks up to PRICE_CHECK_BATCH
-queued rows, oldest first, one at a time, and moves each finished entry to the trash, so a
-burst of additions drains a batch per run instead of hitting the search / LLM limits at
+Which rows: every Purchasing row, however it got there (PERBot's /parts, typed in Notion,
+imported), through a queue in PERBot's Job Log. Each run of the workflow
+(.github/workflows/price-check.yml, every 30 min) with --queue:
+
+  1. finds open, complete rows created in the last PRICE_CHECK_LOOKBACK_HOURS (default 168)
+     that were never queued, and queues them: a "price-check-queue <page id>" entry in the
+     Job Log (claim_once, the same key PERBot's claimOnce writes, so nothing is queued twice);
+  2. checks up to PRICE_CHECK_BATCH queued rows, oldest first, one at a time, and marks each
+     entry done (Job "price-check-done"; the entry stays, so the row isn't queued again).
+
+A burst of new rows drains a batch per run instead of hitting the search / LLM limits at
 once. If search or the LLM is failing, entries stay queued and the run stops after 3.
+PERBot's /parts also queues its rows and sends a repository_dispatch, which just starts a
+run straight away instead of waiting for the schedule.
 
 The alert is a Slack DM to the row's Point of contact (Notion person -> Slack user by email,
 then an unambiguous name match, as PERBot's identity.ts does). Each alert is claimed once in
@@ -37,10 +44,11 @@ Environment (same names as PERBot; .env is read like scraper.py):
   PRICE_CHECK_CHANNEL              post here when the orderer can't be matched (default: log only)
   PRICE_CHECK_POOL                 search results read per row (default 15, like PARTS_POOL)
   PRICE_CHECK_BATCH                queued rows checked per run (default 10)
+  PRICE_CHECK_LOOKBACK_HOURS       queue new rows created this recently (default 168; 0 = off)
   plus the search / distributor / LLM keys scraper2.py uses.
 
 Usage:
-    python price_check.py --queue -v              # drain the queue (what the workflow runs)
+    python price_check.py --queue -v              # find new rows + drain (what the workflow runs)
     python price_check.py --enqueue <notion url>  # queue a row by hand
     python price_check.py --row <notion url/id>   # check one row now
     python price_check.py --all --dry-run -v      # sweep every open row, print alerts only
@@ -52,7 +60,7 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -78,8 +86,10 @@ COL_CONTACT = "Point of contact"
 COL_NOTES = "Notes (internal)"
 COL_SEASON = "Season"
 COL_EXPORTED = "Exported?"
-# Job Log entries PERBot writes for rows to check ("price-check-queue <page id>").
+# Job Log entries for rows to check ("price-check-queue <page id>", Job = QUEUE_JOB); once
+# checked, Job becomes DONE_JOB and the entry stays as the "already seen" record.
 QUEUE_JOB = "price-check-queue"
+DONE_JOB = "price-check-done"
 # A sweep stops after this many rows in a row got no price because search / the LLM was
 # failing (quota, outage), instead of running through every row for nothing.
 MAX_OUTAGE_ROWS = 3
@@ -98,6 +108,7 @@ class Config:
     fallback_channel: str = ""
     pool: int = 15
     batch: int = 10
+    lookback_hours: float = 168
 
     @classmethod
     def from_env(cls, need_slack=True):
@@ -129,6 +140,7 @@ class Config:
             fallback_channel=env("PRICE_CHECK_CHANNEL"),
             pool=int(number("PRICE_CHECK_POOL", 15)),
             batch=max(1, int(number("PRICE_CHECK_BATCH", 10))),
+            lookback_hours=number("PRICE_CHECK_LOOKBACK_HOURS", 168),
         )
 
 
@@ -168,9 +180,8 @@ class Notion:
     def page(self, page_id):
         return self._call("GET", f"/pages/{page_id}")
 
-    def trash(self, page_id):
-        """Move a page to the trash (restorable from Notion's Trash)."""
-        return self._call("PATCH", f"/pages/{page_id}", {"in_trash": True})
+    def update(self, page_id, properties):
+        return self._call("PATCH", f"/pages/{page_id}", {"properties": properties})
 
     def create(self, data_source_id, properties):
         return self._call("POST", "/pages", {
@@ -216,6 +227,25 @@ def queue_key(page_id):
 def enqueue(notion, cfg, page_id):
     """Queue a row, as PERBot does (no-op if it's already queued). True if newly queued."""
     return claim_once(notion, cfg, queue_key(page_id), job=QUEUE_JOB)
+
+
+def mark_done(notion, entry_id):
+    """Mark a queue entry checked; it stays in the Job Log so the row isn't queued again."""
+    notion.update(entry_id, {"Job": {"rich_text": [{"text": {"content": DONE_JOB}}]}})
+
+
+def discover(notion, cfg, now=None, dry_run=False):
+    """Queue open, complete Purchasing rows created in the last cfg.lookback_hours that were
+    never queued (rows from /parts are usually queued by PERBot already). Returns the page
+    ids newly queued (with dry_run: the ones that would be)."""
+    if cfg.lookback_hours <= 0:
+        return []
+    since = (now or datetime.now(timezone.utc)) - timedelta(hours=cfg.lookback_hours)
+    pages = notion.query(cfg.purchasing_ds, {"and": _open_filter(cfg) + [
+        {"timestamp": "created_time", "created_time": {"on_or_after": since.isoformat()}}]},
+        sorts=[{"timestamp": "created_time", "direction": "ascending"}])
+    return [pg["id"] for pg in pages
+            if claim_once(notion, cfg, queue_key(pg["id"]), job=QUEUE_JOB, dry_run=dry_run)]
 
 
 def queued(notion, cfg, limit=None):
@@ -554,9 +584,10 @@ class Checker:
         return "alerted" if self._alert(f, label) else "ok"
 
     def drain(self, entries):
-        """Check queued rows [(Job Log entry id, page id)] in order. Entries are trashed once
-        their row is checked, skipped or gone; failures stay queued, and the run stops after
-        MAX_OUTAGE_ROWS of them in a row. Returns {status: count}."""
+        """Check queued rows [(Job Log entry id, page id)] in order. Entries are marked done
+        once their row is checked, skipped or gone; failures stay queued, and the run stops
+        after MAX_OUTAGE_ROWS of them in a row. An entry id of None (a dry-run preview of a
+        row discovery would queue) is checked but not marked. Returns {status: count}."""
         counts, outages = {}, 0
         for i, (entry, pid) in enumerate(entries, 1):
             try:
@@ -577,11 +608,11 @@ class Checker:
                     break
                 continue
             outages = 0
-            if not self.dry_run:
+            if entry and not self.dry_run:
                 try:
-                    self.notion.trash(entry)
+                    mark_done(self.notion, entry)
                 except RuntimeError as e:
-                    print(f"  couldn't remove queue entry {entry}: {e}", file=sys.stderr)
+                    print(f"  couldn't mark queue entry {entry} done: {e}", file=sys.stderr)
         return counts
 
     def check_all(self, rows):
@@ -671,7 +702,14 @@ def main():
         return
     slack = Slack(cfg.slack_token) if cfg.slack_token else None
     if a.queue:
+        found = discover(notion, cfg, dry_run=a.dry_run)
+        if found:
+            print(f"Price check: {len(found)} new row(s) "
+                  f"{'would be ' if a.dry_run else ''}queued.", file=sys.stderr)
         entries = queued(notion, cfg, a.limit or cfg.batch)
+        if a.dry_run:  # nothing was written: preview the rows discovery found too
+            entries += [(None, pid) for pid in found]
+            entries = entries[:a.limit or cfg.batch]
         if not entries:  # nothing to do: don't touch the LLM
             print("Price check: queue is empty.", file=sys.stderr)
             return
