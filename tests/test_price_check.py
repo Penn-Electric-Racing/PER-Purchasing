@@ -390,8 +390,9 @@ def test_config_rejects_non_numbers(monkeypatch):
 
 # ---------------------------------------------------------------- Notion client (HTTP faked)
 class HTTPResp:
-    def __init__(self, body, status=200):
+    def __init__(self, body, status=200, headers=None):
         self._body, self.status_code, self.text = body, status, str(body)
+        self.headers = headers or {}
 
     def json(self):
         return self._body
@@ -568,3 +569,44 @@ def test_main_exits_without_an_llm(monkeypatch):
     monkeypatch.setattr(pc.sys, "argv", ["price_check.py", "--all", "--dry-run"])
     with pytest.raises(SystemExit, match="no LLM configured"):
         pc.main()
+
+
+# ---------------------------------------------------------------- rate limits (HTTP 429)
+@pytest.fixture
+def slept(monkeypatch):
+    waits = []
+    monkeypatch.setattr(pc.time, "sleep", waits.append)
+    return waits
+
+
+def test_notion_429_waits_and_retries(monkeypatch, slept):
+    calls = notion_http(monkeypatch, HTTPResp({}, 429, {"Retry-After": "2"}), {"id": "p"})
+    assert pc.Notion("t", "v").page("p") == {"id": "p"}
+    assert len(calls) == 2 and slept == [2.0]
+
+
+def test_slack_429_does_not_lose_the_dm(monkeypatch, slept):
+    responses = [HTTPResp({"ok": False, "error": "ratelimited"}, 429, {"Retry-After": "1"}),
+                 HTTPResp({"ok": True})]
+    sent = []
+
+    def post(url, headers, timeout, json=None, params=None):
+        sent.append(json)
+        return responses.pop(0)
+    monkeypatch.setattr(pc.requests, "post", post)
+    pc.Slack("t").post("U1", "hi")
+    assert len(sent) == 2 and slept == [1.0]
+
+
+def test_rate_limit_wait_is_capped_and_defaults(monkeypatch, slept):
+    notion_http(monkeypatch, HTTPResp({}, 429, {"Retry-After": "600"}),
+                HTTPResp({}, 429, {"Retry-After": "soon"}), {"id": "p"})
+    pc.Notion("t", "v").page("p")
+    assert slept == [pc.MAX_RETRY_WAIT, 2]   # capped; unreadable -> 2^attempt
+
+
+def test_rate_limit_gives_up_after_retries(monkeypatch, slept):
+    calls = notion_http(monkeypatch, *[HTTPResp({}, 429)] * (pc.RATE_LIMIT_RETRIES + 1))
+    with pytest.raises(RuntimeError, match="HTTP 429"):
+        pc.Notion("t", "v").page("p")
+    assert len(calls) == pc.RATE_LIMIT_RETRIES + 1 and slept == [1, 2, 4]
