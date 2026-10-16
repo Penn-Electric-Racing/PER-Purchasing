@@ -12,20 +12,13 @@ product link, and compares the unit price found at that quantity with the row's 
   alert when  |found - Unit cost| / Unit cost >= PRICE_CHECK_THRESHOLD_PCT
          and  |found - Unit cost| x Quant. >= PRICE_CHECK_MIN_DELTA_USD
 
-Which rows: every Purchasing row, however it got there (PERBot's /parts, typed in Notion,
-imported), through a queue in PERBot's Job Log. Each run of the workflow
-(.github/workflows/price-check.yml, every 30 min) with --queue:
-
-  1. finds open, complete rows created in the last PRICE_CHECK_LOOKBACK_HOURS (default 168)
-     that were never queued, and queues them: a "price-check-queue <page id>" entry in the
-     Job Log (claim_once, the same key PERBot's claimOnce writes, so nothing is queued twice);
-  2. checks up to PRICE_CHECK_BATCH queued rows, oldest first, one at a time, and marks each
-     entry done (Job "price-check-done"; the entry stays, so the row isn't queued again).
-
-A burst of new rows drains a batch per run instead of hitting the search / LLM limits at
-once. If search or the LLM is failing, entries stay queued and the run stops after 3.
-PERBot's /parts also queues its rows and sends a repository_dispatch, which just starts a
-run straight away instead of waiting for the schedule.
+Which rows: new Purchasing rows, however they got there (PERBot's /parts, typed in Notion,
+imported). price_listener.py hears about them from Notion's webhooks and queues them in
+PERBot's Job Log ("price-check-queue <page id>", the same entry PERBot's /parts writes),
+then checks the queue one row at a time with Checker.drain. This file holds the check and
+the queue helpers, plus a CLI: --queue does one pass by hand (queue complete rows created
+in the last PRICE_CHECK_LOOKBACK_HOURS that were never queued, then check up to
+PRICE_CHECK_BATCH queued rows and mark them done).
 
 The alert is a Slack DM to the row's Point of contact (Notion person -> Slack user by email,
 then an unambiguous name match, as PERBot's identity.ts does). Each alert is claimed once in
@@ -48,7 +41,7 @@ Environment (same names as PERBot; .env is read like scraper.py):
   plus the search / distributor / LLM keys scraper2.py uses.
 
 Usage:
-    python price_check.py --queue -v              # find new rows + drain (what the workflow runs)
+    python price_check.py --queue -v              # one pass: queue new rows + check the queue
     python price_check.py --enqueue <notion url>  # queue a row by hand
     python price_check.py --row <notion url/id>   # check one row now
     python price_check.py --all --dry-run -v      # sweep every open row, print alerts only
@@ -681,7 +674,7 @@ def main():
                                             "when the price moved.")
     which = p.add_mutually_exclusive_group(required=True)
     which.add_argument("--queue", action="store_true",
-                       help="check the next PRICE_CHECK_BATCH rows PERBot queued (the workflow)")
+                       help="queue new rows, then check up to PRICE_CHECK_BATCH queued rows")
     which.add_argument("--enqueue", metavar="ROW", help="queue a Purchasing page (Notion URL or id)")
     which.add_argument("--row", help="check this Purchasing page now (Notion URL or id)")
     which.add_argument("--all", action="store_true", help="sweep every open row, oldest first")

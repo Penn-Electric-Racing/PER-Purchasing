@@ -1,0 +1,43 @@
+# Render blueprint for the Purchasing price-check listener (price_listener.py).
+# Notion webhooks POST to https://<this service>/notion/webhook; see the README.
+# A paid instance (starter) stays up: free web services sleep after 15 minutes without
+# requests, which pauses the worker (queued rows wait in the Job Log until it wakes).
+services:
+  - type: web
+    name: per-price-listener
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python price_listener.py
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      # Same values as PERBot's Render service.
+      - key: NOTION_TOKEN
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      # The Notion webhook subscription's verification token (logged on first contact).
+      - key: NOTION_WEBHOOK_SECRET
+        sync: false
+      # Search (DuckDuckGo blocks cloud IPs), LLM and distributor keys.
+      - key: SERPER_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MOUSER_API_KEY
+        sync: false
+      - key: DIGIKEY_CLIENT_ID
+        sync: false
+      - key: DIGIKEY_CLIENT_SECRET
+        sync: false
+      - key: PRICE_CHECK_THRESHOLD_PCT
+        value: 10
+      - key: PRICE_CHECK_MIN_DELTA_USD
+        value: 0
+      - key: PRICE_LISTENER_MAX_PER_HOUR
+        value: 20
