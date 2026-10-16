@@ -204,7 +204,7 @@ class FakeNotionAPI:
     entries = []
 
     def __init__(self, token, version):
-        self.token, self.created, self.limits, self.trashed = token, [], [], []
+        self.token, self.created, self.limits, self.done = token, [], [], []
         FakeNotionAPI.instances.append(self)
 
     def query(self, ds, filter_=None, page_size=100, sorts=None, limit=None):
@@ -219,8 +219,8 @@ class FakeNotionAPI:
     def page(self, page_id):
         return {**ROW, "id": page_id}
 
-    def trash(self, page_id):
-        self.trashed.append(page_id)
+    def update(self, page_id, props):
+        self.done.append(page_id)
 
     def create(self, ds, props):
         self.created.append(props)
@@ -290,11 +290,21 @@ def test_price_check_queue_drains_entries(monkeypatch, notion_env, capsys):
     monkeypatch.setenv("PRICE_CHECK_BATCH", "4")
     run(pc, monkeypatch, "--queue")
     notion = FakeNotionAPI.instances[0]
-    assert notion.limits == [4] and notion.trashed == ["e1"]
-    assert FakeSlackAPI.posts and "Price check: 1 alerted" in capsys.readouterr().err
+    assert notion.limits == [None, 4] and notion.done == ["e1"]  # discovery, then the queue
+    assert len(notion.created) == 2  # row1 discovered + queued, then its alert claim
+    err = capsys.readouterr().err
+    assert FakeSlackAPI.posts and "1 new row(s) queued" in err and "Price check: 1 alerted" in err
+
+
+def test_price_check_queue_dry_run_previews_discovered_rows(monkeypatch, notion_env, capsys):
+    run(pc, monkeypatch, "--queue", "--dry-run")
+    notion = FakeNotionAPI.instances[0]
+    assert notion.created == [] and notion.done == []  # nothing written
+    assert notion_env and "1 new row(s) would be queued" in capsys.readouterr().err
 
 
 def test_price_check_empty_queue_skips_the_llm(monkeypatch, notion_env, capsys):
+    monkeypatch.setenv("PRICE_CHECK_LOOKBACK_HOURS", "0")  # no discovery
     monkeypatch.setattr(scraper2, "LLM", lambda *a, **k: (_ for _ in ()).throw(AssertionError("LLM used")))
     run(pc, monkeypatch, "--queue")
     assert "queue is empty" in capsys.readouterr().err and notion_env == []

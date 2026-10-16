@@ -267,55 +267,62 @@ every extracted field, plus `unit_cost`, `pack_size`, `packs_needed`,
 `subtotal`, `total`, `effective_cost`, `enough_stock`, `ship_days`,
 `relevance`, `mpn_variants`, `notes` and `fetch_error`.
 
-## Purchasing price check (`price_check.py`)
+## Purchasing price check (`price_listener.py`, `price_check.py`)
 
-Re-prices rows that PERBot's `/parts` adds to the Purchasing (PEFS) Notion
-database, and DMs the row's **Point of contact** on Slack when the price moved.
-Nothing is added to the Purchasing database, and existing rows aren't touched.
+Re-prices new rows in the Purchasing (PEFS) Notion database as they're added,
+however they were added (PERBot's `/parts`, typed into Notion, imported), and
+DMs the row's **Point of contact** on Slack when the price moved. No column is
+added to the database, and rows created before it was set up are left alone.
 
 ```mermaid
 sequenceDiagram
     actor User
-    participant PERBot as PERBot<br/>(Render)
     participant Purchasing as Notion<br/>Purchasing DB
-    participant JobLog as Notion<br/>⚙️ Job Log
-    participant GitHub
-    participant Workflow as price-check.yml<br/>(this repo)
+    participant Listener as price_listener.py<br/>(Render)
+    participant JobLog as Notion<br/>⚙️ Job Log (queue)
     participant Slack
 
-    User->>PERBot: /parts → "Add to Purchasing"
-    PERBot->>Purchasing: create row
-    PERBot->>JobLog: claim "price-check-queue #lt;row id#gt;"
-    PERBot->>GitHub: POST /repos/…/dispatches<br/>{"event_type": "price-check"}
-    Note over GitHub,Workflow: also starts every 30 min (backstop)
-    GitHub->>Workflow: start run (one at a time)
-    Workflow->>JobLog: read up to 10 queued entries, oldest first
-    loop each queued row
-        Workflow->>Purchasing: read row (part, Quant., Unit cost, link)
-        Workflow->>Workflow: search + Mouser/DigiKey + LLM → price at Quant.
+    User->>Purchasing: add a row (/parts, or in Notion)
+    Purchasing->>Listener: webhook: page.created / page.properties_updated
+    Note over Listener: wait 60 s after the row's last edit
+    Listener->>Purchasing: read the row
+    alt open and complete (part, Quant., Unit cost)
+        Listener->>JobLog: queue "price-check-queue #lt;row id#gt;" (once per row)
+    end
+    loop worker: one row at a time, at most 20 an hour
+        Listener->>JobLog: oldest queued entry
+        Listener->>Purchasing: read the row
+        Listener->>Listener: search + Mouser/DigiKey + LLM → price at Quant.
         alt price moved past the threshold
-            Workflow->>JobLog: claim "price-alert #lt;row#gt; #lt;cost#gt; x#lt;qty#gt;"
-            Workflow->>Slack: DM the Point of contact
+            Listener->>JobLog: claim "price-alert #lt;row#gt; #lt;cost#gt; x#lt;qty#gt;"
+            Listener->>Slack: DM the Point of contact
         end
-        Workflow->>JobLog: trash the queue entry
+        Listener->>JobLog: mark the entry done
     end
 ```
 
-**How rows get here:** when `/parts` → "Add to Purchasing" creates a row,
-PERBot (`src/partFinder/priceCheck.ts`):
+**How it works:** `price_listener.py` is a small web server that Notion's
+webhooks call when a page is created or edited.
 
-1. claims `price-check-queue <page id>` in its ⚙️ Job Log (its `claimOnce`),
-   which is the queue, and
-2. sends this repo a GitHub `repository_dispatch` (event type `price-check`),
-   which starts `.github/workflows/price-check.yml` right away.
+1. **Settle:** a row is read 60 s (`PRICE_LISTENER_SETTLE_SECONDS`) after its
+   *last* event, so a row typed in by hand (created empty, then filled in field
+   by field) is looked at once, complete. Only edits to price-relevant columns
+   count (part number, `Quant.`, `Unit cost`, link, `Season`, `Exported?`,
+   notes), and other databases' events are ignored.
+2. **Queue:** if it's open and complete, it's queued in PERBot's ⚙️ Job Log as
+   `price-check-queue <page id>`, the same entry PERBot's `/parts` writes, so a
+   row is queued once however many events or apps report it.
+3. **Check:** one worker drains the queue one row at a time, at most 20 an
+   hour (`PRICE_LISTENER_MAX_PER_HOUR`) with the LLM paced per minute on top,
+   and marks each entry done (`price-check-done`). A burst of 100 new rows
+   waits its turn instead of hitting the search and LLM limits at once. If
+   search or the LLM is failing (quota, outage), the row stays queued and the
+   worker backs off 10 min, 20 min, ... up to 6 h.
 
-The workflow also runs every 30 minutes as a backstop. Each run
-(`price_check.py --queue`) checks up to `PRICE_CHECK_BATCH` queued rows
-(default 10), oldest first, one at a time, and moves each finished entry to
-Notion's trash. Runs never overlap. A burst of 100 additions is worked through
-10 per run instead of hitting the search and LLM limits at once. If search or
-the LLM is failing (quota, outage), entries stay queued and the run stops after
-3 such rows.
+The queue lives in Notion, so a restart loses nothing that was queued. On
+startup the listener also queues complete rows created in the last
+`PRICE_CHECK_LOOKBACK_HOURS` (default a week) that were never queued, which
+covers anything added while it was down.
 
 **Which rows are checked:** this season's (`BENBUYS_SEASON`, default `REV12`)
 rows with `Exported?` unchecked and a `Cat. or model no.`, `Quant.` and
@@ -342,22 +349,28 @@ It uses PERBot's environment names: `NOTION_TOKEN` (or `NOTION_API_KEY`),
 
 ### Setting it up
 
-1. **This repo** (Settings → Secrets and variables → Actions): add the secrets
-   the workflow lists (`NOTION_API_KEY`, `SLACK_BOT_TOKEN`, a search key such as
-   `SERPER_API_KEY`, an LLM key, the distributor keys), and optionally the
-   thresholds as variables.
-2. **A GitHub token for PERBot:** a fine-grained personal access token with
-   access to only this repo and **Contents: Read and write** (what
-   `repository_dispatch` needs).
-3. **PERBot's Render service:** set `PRICE_CHECK_QUEUE=true` and
-   `PRICE_CHECK_DISPATCH_TOKEN=<that token>`
-   (`PRICE_CHECK_DISPATCH_REPO` defaults to `pandabear189/PER-Purchase-Testing`).
-   Without the token rows are still queued; the 30-minute schedule picks them up.
+1. **Deploy** it with a public HTTPS URL. `render.yaml` describes a Render web
+   service; fill in the secrets it lists (PERBot's `NOTION_TOKEN` and
+   `SLACK_BOT_TOKEN`, a search key such as `SERPER_API_KEY`, an LLM key, the
+   distributor keys). Use a paid instance: free ones sleep after 15 minutes
+   without requests, which pauses the worker.
+2. In the Notion integration's settings (PERBot's, the one `NOTION_TOKEN`
+   belongs to) → **Webhooks**, add a subscription to
+   `https://<your host>/notion/webhook` with the events `page.created` and
+   `page.properties_updated`.
+3. Notion sends a verification token, and the listener prints it in its log.
+   Paste it into Notion to verify the subscription, and set it as
+   `NOTION_WEBHOOK_SECRET` (every event's signature is checked against it).
+4. `GET /healthz` shows rows waiting to settle and checks this hour.
+
+PERBot needs no changes: its `/parts` rows arrive as webhook events like any
+other. (Its optional `PRICE_CHECK_QUEUE` hook just queues them a minute sooner.)
 
 ### Manual commands
 
 ```bash
-python price_check.py --queue --dry-run -v         # preview the queue, send and change nothing
+python price_listener.py --dry-run                 # run the listener, log alerts, write nothing
+python price_check.py --queue --dry-run -v         # one pass: new rows + queue, nothing written
 python price_check.py --enqueue <notion page url>  # queue a row by hand (e.g. one typed in Notion)
 python price_check.py --row <notion page url>      # check one row now
 python price_check.py --all --dry-run -v           # every open row, print alerts only
@@ -370,7 +383,8 @@ scraper.py         search backends, page fetching, regex/JSON-LD extraction, CLI
 scraper2.py        LLM client + LLM extraction; reuses search from scraper.py
 distributors.py    Mouser + DigiKey API lookups, minimum-order maths
 price_check.py     Purchasing (Notion) price check + Slack alerts; drains PERBot's queue
-.github/workflows/price-check.yml   runs it on PERBot's dispatch + every 30 min
+price_listener.py  Notion webhook server: settle -> Job Log queue -> rate-limited checks
+render.yaml        Render web service for the listener
 ranking.py         Weights, Scorer (score_all, pick_top), relevance, ship_days
 tests/
   test_scraper.py    extraction, shipping, fetching and ranking regressions
@@ -380,6 +394,7 @@ tests/
   test_ranking.py    Weights / Scorer / --weights files
   test_distributors.py  Mouser / DigiKey parsing and ranking (APIs faked)
   test_price_check.py   row parsing, price comparison, identity, alerts (all faked)
+  test_listener.py      webhook signature/routing, settling, rate limit, worker, HTTP
 requirements.txt
 ```
 
