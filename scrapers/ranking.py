@@ -1,12 +1,12 @@
 """
-ranking.py - score and pick the best purchase options (used by scraper.py and scraper2.py).
+ranking.py - score and pick the best purchase options (used by both scrapers).
 
 Score = (effective order cost / cheapest effective cost) x penalty multipliers.
 1.00 is the cheapest candidate with nothing counting against it; lower is better.
 
 Tune it by editing the defaults in Weights, or per run without touching code:
     scorer = Scorer(Weights(out_of_stock=2.0, per_ship_day=0.05))
-    python scraper.py "LM7805" --weights my_weights.json   # {"out_of_stock": 2.0, ...}
+    python -m scrapers.regex_scraper "LM7805" --weights my_weights.json   # {"out_of_stock": 2.0, ...}
 """
 import json
 import re
@@ -31,8 +31,8 @@ class Weights:
     slow_note_days: int = 10         # add a "slow" note at this many days
     ship_time_unknown: float = 1.06
     ship_cost_unknown: float = 1.04  # on top of adding the median known shipping cost
-    # Confidence in where the price came from (scraper.py: json-ld/meta/page text/snippet,
-    # scraper2.py: llm/llm snippet, both: api = Mouser/DigiKey APIs).
+    # Confidence in where the price came from (regex_scraper.py: json-ld/meta/page text/snippet,
+    # llm_scraper.py: llm/llm snippet, both: api = Mouser/DigiKey APIs).
     # Unlisted sources get unknown_source.
     source: dict = field(default_factory=lambda: {
         "json-ld": 1.0, "meta": 1.0, "page text": 1.05, "snippet": 1.15,

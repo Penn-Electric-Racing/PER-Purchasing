@@ -1,24 +1,28 @@
-"""Offline tests for price_check.py: Notion, Slack and the search are faked.
+"""Offline tests for pricecheck: Notion, Slack and the search are faked.
 
     pip install requests beautifulsoup4 pytest
     pytest
 """
-import os
 import sys
+import time
+from datetime import datetime, timezone
 
 import pytest
+import requests
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import price_check as pc  # noqa: E402
-import scraper  # noqa: E402
-from ranking import Scorer  # noqa: E402
+import pricecheck as pc
+from pricecheck import check
+from pricecheck.api import MAX_RETRY_WAIT, RATE_LIMIT_RETRIES
+from pricecheck.config import DEFAULT_JOB_LOG_DS, DEFAULT_PURCHASING_DS
+from scrapers import llm_scraper, regex_scraper
+from scrapers.ranking import Scorer
 
 CFG = pc.Config(notion_token="n", slack_token="s", threshold_pct=10, min_delta_usd=0)
 
 
 def page(pid="p1", part="LM7805CT/NOPB", qty=50, cost=1.00, link="https://www.digikey.com/x",
          contacts=(("u1", "Ada Lovelace", "ada@upenn.edu"),), notes="", season="REV12",
-         exported=False, parent=pc.DEFAULT_PURCHASING_DS):
+         exported=False, parent=DEFAULT_PURCHASING_DS):
     return {"id": pid, "url": f"https://www.notion.so/{pid}",
             "parent": {"type": "data_source_id", "data_source_id": parent}, "properties": {
         "Name": {"type": "title", "title": [{"plain_text": "5V regulator"}]},
@@ -35,11 +39,11 @@ def page(pid="p1", part="LM7805CT/NOPB", qty=50, cost=1.00, link="https://www.di
 
 
 def listing(url, unit, qty=50, title="LM7805CT/NOPB regulator", supplier=None, **kw):
-    r = {"title": title, "url": url, "snippet": "", "search_rank": 0, **scraper._blank_info()}
+    r = {"title": title, "url": url, "snippet": "", "search_rank": 0, **regex_scraper._blank_info()}
     r.update({"cost": unit, "currency": "USD", "cost_source": "llm",
               "supplier": supplier or url.split("/")[2], "in_stock": True,
               "shipping_cost": "Free", "shipping_time": "2 days", **kw})
-    return scraper.apply_qty(r, qty)
+    return regex_scraper.apply_qty(r, qty)
 
 
 def scored(*rs, query="LM7805CT/NOPB", qty=50):
@@ -116,7 +120,7 @@ def test_parts_pack_rows_compare_per_unit():
                                "0123456789abcdef0123456789abcdef",
                                "01234567-89ab-cdef-0123-456789abcdef"])
 def test_page_id(s):
-    assert pc._page_id(s).replace("-", "") == "0123456789abcdef0123456789abcdef"
+    assert check._page_id(s).replace("-", "") == "0123456789abcdef0123456789abcdef"
 
 
 # ---------------------------------------------------------------- compare
@@ -232,7 +236,7 @@ def test_rows_that_are_not_checked(kw, reason):
 def test_open_purchasing_row_is_checked():
     assert pc.skip_reason(pc.parse_row(page()), CFG) is None
     # Same id written without dashes still matches.
-    assert pc.skip_reason(pc.parse_row(page(parent=pc.DEFAULT_PURCHASING_DS.replace("-", ""))), CFG) is None
+    assert pc.skip_reason(pc.parse_row(page(parent=DEFAULT_PURCHASING_DS.replace("-", ""))), CFG) is None
 
 
 def test_unmatched_contact_falls_back_to_channel():
@@ -329,7 +333,7 @@ def test_drain_preview_entries_are_not_marked():
 # ---------------------------------------------------------------- discovery
 def test_discover_queues_new_complete_rows_once():
     notion = FakeNotion(rows=[page("new1"), page("new2")], claimed=["price-check-queue new2"])
-    now = pc.datetime(2026, 10, 15, 12, tzinfo=pc.timezone.utc)
+    now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
     assert pc.discover(notion, CFG, now) == ["new1"]          # new2: PERBot queued it already
     assert notion.created == ["price-check-queue new1"]
     filter_, sorts, limit = notion.queries[0]
@@ -376,7 +380,7 @@ def test_config_from_env(monkeypatch):
     monkeypatch.setenv("PRICE_CHECK_MIN_DELTA_USD", "2.5")
     cfg = pc.Config.from_env()
     assert (cfg.notion_token, cfg.threshold_pct, cfg.min_delta_usd) == ("n", 15, 2.5)
-    assert cfg.season == "REV12" and cfg.job_log_ds == pc.DEFAULT_JOB_LOG_DS
+    assert cfg.season == "REV12" and cfg.job_log_ds == DEFAULT_JOB_LOG_DS
     monkeypatch.setenv("NOTION_JOB_LOG_DS_ID", "")  # set but empty = dedup off, as in PERBot
     assert pc.Config.from_env().job_log_ds == ""
 
@@ -405,7 +409,7 @@ def notion_http(monkeypatch, *bodies):
         calls.append((method, url, json, headers))
         body = queue.pop(0)
         return body if isinstance(body, HTTPResp) else HTTPResp(body)
-    monkeypatch.setattr(pc.requests, "request", request)
+    monkeypatch.setattr(requests, "request", request)
     return calls
 
 
@@ -476,8 +480,8 @@ def slack_http(monkeypatch, *bodies):
     def fake(url, headers, timeout, json=None, params=None):
         calls.append((url.rsplit("/", 1)[1], json or params, headers))
         return HTTPResp(queue.pop(0))
-    monkeypatch.setattr(pc.requests, "post", fake)
-    monkeypatch.setattr(pc.requests, "get", fake)
+    monkeypatch.setattr(requests, "post", fake)
+    monkeypatch.setattr(requests, "get", fake)
     return calls
 
 
@@ -559,23 +563,23 @@ def test_alert_lists_flags_but_not_estimated_shipping():
 
 
 def test_main_exits_without_an_llm(monkeypatch):
-    monkeypatch.setattr(pc, "load_env", lambda *a: None)
+    monkeypatch.setattr(check, "load_env", lambda *a: None)
     monkeypatch.setenv("NOTION_TOKEN", "n")
-    monkeypatch.setattr(pc, "Notion", lambda t, v: FakeNotion(rows=[page()]))
+    monkeypatch.setattr(check, "Notion", lambda t, v: FakeNotion(rows=[page()]))
 
     def no_llm(*a, **k):
-        raise pc.scraper2.LLMError("no LLM configured")
-    monkeypatch.setattr(pc.scraper2, "LLM", no_llm)
-    monkeypatch.setattr(pc.sys, "argv", ["price_check.py", "--all", "--dry-run"])
+        raise llm_scraper.LLMError("no LLM configured")
+    monkeypatch.setattr(llm_scraper, "LLM", no_llm)
+    monkeypatch.setattr(sys, "argv", ["pricecheck.check", "--all", "--dry-run"])
     with pytest.raises(SystemExit, match="no LLM configured"):
-        pc.main()
+        check.main()
 
 
 # ---------------------------------------------------------------- rate limits (HTTP 429)
 @pytest.fixture
 def slept(monkeypatch):
     waits = []
-    monkeypatch.setattr(pc.time, "sleep", waits.append)
+    monkeypatch.setattr(time, "sleep", waits.append)
     return waits
 
 
@@ -593,7 +597,7 @@ def test_slack_429_does_not_lose_the_dm(monkeypatch, slept):
     def post(url, headers, timeout, json=None, params=None):
         sent.append(json)
         return responses.pop(0)
-    monkeypatch.setattr(pc.requests, "post", post)
+    monkeypatch.setattr(requests, "post", post)
     pc.Slack("t").post("U1", "hi")
     assert len(sent) == 2 and slept == [1.0]
 
@@ -602,11 +606,11 @@ def test_rate_limit_wait_is_capped_and_defaults(monkeypatch, slept):
     notion_http(monkeypatch, HTTPResp({}, 429, {"Retry-After": "600"}),
                 HTTPResp({}, 429, {"Retry-After": "soon"}), {"id": "p"})
     pc.Notion("t", "v").page("p")
-    assert slept == [pc.MAX_RETRY_WAIT, 2]   # capped; unreadable -> 2^attempt
+    assert slept == [MAX_RETRY_WAIT, 2]   # capped; unreadable -> 2^attempt
 
 
 def test_rate_limit_gives_up_after_retries(monkeypatch, slept):
-    calls = notion_http(monkeypatch, *[HTTPResp({}, 429)] * (pc.RATE_LIMIT_RETRIES + 1))
+    calls = notion_http(monkeypatch, *[HTTPResp({}, 429)] * (RATE_LIMIT_RETRIES + 1))
     with pytest.raises(RuntimeError, match="HTTP 429"):
         pc.Notion("t", "v").page("p")
-    assert len(calls) == pc.RATE_LIMIT_RETRIES + 1 and slept == [1, 2, 4]
+    assert len(calls) == RATE_LIMIT_RETRIES + 1 and slept == [1, 2, 4]
