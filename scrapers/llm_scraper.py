@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-scraper2.py - scraper.py, but an LLM reads each page instead of regex.
+llm_scraper.py - regex_scraper.py, but an LLM reads each page instead of regex.
 
-Search and output are the same as scraper.py (imported from it) and ranking
-is ranking.py. The difference is extraction: each result page is cut down to
+Search (websearch.py) and ranking (ranking.py) are shared with regex_scraper.py.
+The difference is extraction: each result page is cut down to
 readable text (plus any schema.org JSON-LD), and a free/cheap LLM returns the
 fields as JSON:
 cost, currency, supplier, shipping time/cost, free-shipping minimum, stock,
@@ -24,10 +24,10 @@ Free tiers are rate-limited per minute, so requests are paced (--rpm) and
 Usage:
     pip install requests beautifulsoup4
     export GEMINI_API_KEY=...
-    python scraper2.py "LM7805 voltage regulator"
-    python scraper2.py "LM7805" -q 50 --json
-    python scraper2.py "LM7805" --no-fetch          # one LLM call over all snippets
-    python scraper2.py "LM7805" --provider groq --rpm 30
+    python -m scrapers.llm_scraper "LM7805 voltage regulator"
+    python -m scrapers.llm_scraper "LM7805" -q 50 --json
+    python -m scrapers.llm_scraper "LM7805" --no-fetch          # one LLM call over all snippets
+    python -m scrapers.llm_scraper "LM7805" --provider groq --rpm 30
 """
 import argparse
 import json
@@ -42,11 +42,12 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
-import distributors
-from ranking import Scorer, Weights
-from ranking import ship_value as _ship_value
-from scraper import (LISTING_URL_RE, BackendError, _blank_info, _fetch_html, _search_help,
-                     _to_float, load_env, search)
+from . import distributors
+from .env import load_env
+from .ranking import Scorer, Weights
+from .ranking import ship_value as _ship_value
+from .regex_scraper import LISTING_URL_RE, _blank_info, _to_float
+from .websearch import BackendError, _fetch_html, _search_help, search
 
 # provider -> (base url, api key env var or None, default model)
 PROVIDERS = {
@@ -200,7 +201,7 @@ def _num(v):
 
 
 def to_info(d, info, source):
-    """Validate the LLM's JSON and copy it into scraper.py's info dict."""
+    """Validate the LLM's JSON and copy it into regex_scraper.py's info dict."""
     cost = _num(d.get("cost"))
     if cost:  # 0 = "call for price"
         info["cost"], info["cost_source"] = cost, source
@@ -337,7 +338,7 @@ def snippets_info(results, llm, query):
 
 
 def apply_qty(r, qty):
-    """scraper.apply_qty, but with the LLM's pack size instead of a title regex."""
+    """regex_scraper.apply_qty, but with the LLM's pack size instead of a title regex."""
     breaks = sorted(set(r["price_breaks"]))
     r["price_breaks"] = [{"min_qty": q, "price": p} for q, p in breaks]
     units = distributors.order_units(qty, r.get("min_order"), r.get("order_mult"))
@@ -411,7 +412,8 @@ def find(base, qty, llm, scorer=None, pool=30, api_n=10, batch=None, exact=False
 def main():
     """Command-line entry point: search, LLM-extract, score and print or dump JSON."""
     p = argparse.ArgumentParser(
-        description="Like scraper.py, but an LLM extracts price/stock/shipping from each page.")
+        prog="python -m scrapers.llm_scraper",
+        description="Like regex_scraper.py, but an LLM extracts price/stock/shipping from each page.")
     p.add_argument("query", nargs="+")
     p.add_argument("-n", "--top", type=int, default=5, help="options to return (default 5)")
     p.add_argument("--pool", type=int, default=30,
