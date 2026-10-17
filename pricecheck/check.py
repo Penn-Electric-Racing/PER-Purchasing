@@ -185,7 +185,7 @@ class Checker:
               file=sys.stderr)
         blocks = alert_blocks(f, text)
         if self.dry_run:
-            buttons = blocks[1]["elements"] if len(blocks) > 1 else []
+            buttons = [e for b in blocks[1:] for e in b["elements"]]
             print(text + ("\n[" + " | ".join(b["text"]["text"] for b in buttons) + "]"
                           if buttons else "") + "\n")
             return True
