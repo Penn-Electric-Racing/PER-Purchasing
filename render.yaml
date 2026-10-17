@@ -1,4 +1,4 @@
-# Render Blueprint for the Purchasing price check (pricecheck/listener.py).
+# Render Blueprint for the Purchasing price check (price_listener.py).
 # Render → New → Blueprint → this repo. Notion webhooks then POST to
 # https://per-price-listener.onrender.com/notion/webhook (see the README's Setup).
 # Starter plan: a free web service sleeps after 15 minutes without requests, which pauses
@@ -11,7 +11,7 @@ services:
     branch: main
     autoDeploy: true
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m pricecheck
+    startCommand: python price_listener.py
     healthCheckPath: /healthz
     envVars:
       - key: PYTHON_VERSION

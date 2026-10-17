@@ -8,7 +8,7 @@ pages) and compared with the `Unit cost` in Notion.
 
 ```
 Notion row added or edited
-  → webhook → pricecheck (python -m pricecheck)
+  → webhook → price_listener.py
   → wait for edits to settle → queue in PERBot's Job Log
   → worker: search + Mouser/DigiKey + LLM → price at Quant.
   → price moved past the threshold → Slack DM to the Point of contact
@@ -18,7 +18,7 @@ Notion row added or edited
 sequenceDiagram
     actor User
     participant Purchasing as Notion<br/>Purchasing DB
-    participant Listener as pricecheck listener<br/>(Render)
+    participant Listener as price_listener.py<br/>(Render)
     participant JobLog as Notion<br/>⚙️ Job Log (queue)
     participant Slack
 
@@ -43,7 +43,7 @@ sequenceDiagram
 
 ## How it works
 
-`pricecheck/listener.py` is the app (`python -m pricecheck`): a small web server that Notion's webhooks call
+`price_listener.py` is the app: a small web server that Notion's webhooks call
 when a page is created or edited. Everything else runs from there.
 
 1. **Settle:** a row is read 60 s (`PRICE_LISTENER_SETTLE_SECONDS`) after its
@@ -70,7 +70,7 @@ covers anything added while it was down.
 rows with `Exported?` unchecked and a `Cat. or model no.`, `Quant.` and
 `Unit cost`; queued rows that don't qualify are dropped from the queue.
 
-**The check:** `scrapers.find` (the LLM scraper) searches the part number at that quantity
+**The check:** `scraper2.find` searches the part number at that quantity
 (web + Mouser/DigiKey APIs + LLM), always reading the row's
 `Link to product webpage` too. The price at that link is used if it could be
 read, else the best-ranked option, at the price break the quantity reaches.
@@ -93,7 +93,7 @@ the `Retry-After` time and tries again, up to 3 times.
 
 To run it locally first: `pip install -r requirements.txt`, copy `.env.example`
 to `.env` and fill in the settings below, then
-`python -m pricecheck.check --row <notion page url> --dry-run -v` checks one row
+`python price_check.py --row <notion page url> --dry-run -v` checks one row
 without sending or writing anything.
 
 It runs on Render as a web service (`render.yaml`), next to PERBot.
@@ -154,14 +154,14 @@ match PERBot's, so the same values work in both.
 ## Manual commands
 
 ```bash
-python -m pricecheck --dry-run                          # run the listener, log alerts, write nothing
-python -m pricecheck.check --queue --dry-run -v         # one pass: new rows + queue, nothing written
-python -m pricecheck.check --enqueue <notion page url>  # queue a row by hand (e.g. one typed in Notion)
-python -m pricecheck.check --row <notion page url>      # check one row now
-python -m pricecheck.check --all --dry-run -v           # every open row, print alerts only
+python price_listener.py --dry-run                 # run the listener, log alerts, write nothing
+python price_check.py --queue --dry-run -v         # one pass: new rows + queue, nothing written
+python price_check.py --enqueue <notion page url>  # queue a row by hand (e.g. one typed in Notion)
+python price_check.py --row <notion page url>      # check one row now
+python price_check.py --all --dry-run -v           # every open row, print alerts only
 ```
 
-## Part search (`scrapers/`)
+## Part search (`scraper.py`, `scraper2.py`)
 
 The price check is built on these. They also work on their own as a
 command-line part finder.
@@ -172,7 +172,7 @@ listings, works out what your order would cost from each one, including pack
 sizes, bulk pricing and shipping, and ranks the best 5.
 
 ```
-$ python -m scrapers.regex_scraper "LM7805" -q 50
+$ python scraper.py "LM7805" -q 50
 Best 5 of 30 results for "LM7805"  x50  (via serper; 27 pages read, 22 with prices; ranked by best)
 
 1. LM7805CT/NOPB Texas Instruments | Mouser
@@ -195,10 +195,10 @@ There are two scrapers. They share the same search and ranking code:
 
 | | How it reads each page | Needs |
 |---|---|---|
-| **`regex_scraper`** | Structured product data (schema.org JSON-LD), then `<meta>` tags, then regex over the text | Nothing extra |
-| **`llm_scraper`** | Sends the cleaned-up page text to a free or cheap LLM, which returns the fields as JSON | A free LLM API key, or Ollama |
+| **`scraper.py`** | Structured product data (schema.org JSON-LD), then `<meta>` tags, then regex over the text | Nothing extra |
+| **`scraper2.py`** | Sends the cleaned-up page text to a free or cheap LLM, which returns the fields as JSON | A free LLM API key, or Ollama |
 
-`regex_scraper` is fast, free and predictable. `llm_scraper` copes better with
+`scraper.py` is fast, free and predictable. `scraper2.py` copes better with
 unusual page layouts and wording, such as conditional shipping offers, pack
 sizes and price tables. It is slower, because free LLM tiers limit requests
 per minute.
@@ -255,7 +255,7 @@ unknown unless you set the free-shipping minimum for your country, for
 example `MOUSER_FREE_SHIP_MIN=50` and `DIGIKEY_FREE_SHIP_MIN=100`. Check the
 distributor's site for the current amount.
 
-#### LLM key (only for `llm_scraper`)
+#### LLM key (only for `scraper2.py`)
 
 | Provider | Free tier | Environment variable | Default model |
 |---|---|---|---|
@@ -264,7 +264,7 @@ distributor's site for the current amount.
 | [OpenRouter](https://openrouter.ai) | `:free` models | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct:free` |
 | [Ollama](https://ollama.com) (local) | free | none (must be running on `localhost:11434`) | `llama3.2` |
 
-`llm_scraper` uses the first provider in this list that has a key set. You can
+`scraper2.py` uses the first provider in this list that has a key set. You can
 choose a different provider with `--provider`, and a different model with
 `--model` or `LLM_MODEL=...`. If a provider says the default model doesn't
 exist (free model names change often), pass a current one with `--model`.
@@ -272,18 +272,18 @@ exist (free model names change often), pass a current one with `--model`.
 ### Usage
 
 ```bash
-python -m scrapers.regex_scraper "LM7805 voltage regulator"  # best 5 for 1 unit
-python -m scrapers.regex_scraper "LM7805" -q 50              # you need 50 units
-python -m scrapers.regex_scraper "LM7805" --rank cheapest    # lowest order total only
-python -m scrapers.regex_scraper "LM7805" --pool 50 -n 10    # compare 50 results, show 10
-python -m scrapers.regex_scraper "LM7805" --json             # machine-readable output
-python -m scrapers.regex_scraper "LM7805" --no-fetch         # search snippets only (fast)
-python -m scrapers.regex_scraper "LM7805" --weights w.json   # custom ranking weights
+python scraper.py "LM7805 voltage regulator"      # best 5 for 1 unit
+python scraper.py "LM7805" -q 50                  # you need 50 units
+python scraper.py "LM7805" --rank cheapest        # lowest order total only
+python scraper.py "LM7805" --pool 50 -n 10        # compare 50 results, show 10
+python scraper.py "LM7805" --json                 # machine-readable output
+python scraper.py "LM7805" --no-fetch             # search snippets only (fast)
+python scraper.py "LM7805" --weights w.json       # custom ranking weights
 
 export GEMINI_API_KEY=...
-python -m scrapers.llm_scraper "LM7805" -q 50 -v             # same, with LLM extraction
-python -m scrapers.llm_scraper "LM7805" --provider groq --rpm 30
-python -m scrapers.llm_scraper "LM7805" --no-fetch           # one LLM call over all snippets
+python scraper2.py "LM7805" -q 50 -v              # same, with LLM extraction
+python scraper2.py "LM7805" --provider groq --rpm 30
+python scraper2.py "LM7805" --no-fetch            # one LLM call over all snippets
 ```
 
 #### Options (both scrapers)
@@ -302,7 +302,7 @@ python -m scrapers.llm_scraper "LM7805" --no-fetch           # one LLM call over
 | `--json` | off | Print the full results as JSON. |
 | `-v, --verbose` | off | Log skipped search sources, LLM retries and fetch errors to stderr. |
 
-`llm_scraper` only:
+`scraper2.py` only:
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -314,26 +314,26 @@ python -m scrapers.llm_scraper "LM7805" --no-fetch           # one LLM call over
 
 ```
 search ──► fetch each page ──► extract fields ──► apply quantity ──► score ──► pick top N
-(websearch)  (websearch)        regex_scraper       apply_qty          ranking
-                               or llm_scraper
+(scraper)   (scraper)          scraper.py: regex   apply_qty          ranking.py
+                               scraper2.py: LLM
 ```
 
-1. **Search** (`websearch.search`): gets `--pool` unique URLs from the first
-   search source that works. The Mouser and DigiKey APIs (`distributors`)
+1. **Search** (`scraper.search`): gets `--pool` unique URLs from the first
+   search source that works. The Mouser and DigiKey APIs (`distributors.py`)
    are queried too. Their results arrive with all fields filled in, so they
    skip steps 2 and 3. If web search fails, the API results are still ranked.
-2. **Fetch** (`websearch._fetch_html`): downloads each page (up to 5 MB). PDFs
+2. **Fetch** (`scraper._fetch_html`): downloads each page (up to 5 MB). PDFs
    and other non-HTML files are skipped. If a site blocks the request, the
    search snippet is used instead.
 3. **Extract**. Each listing gets these fields: `cost`, `currency`,
    `supplier`, `stock` / `in_stock`, `shipping_cost`, `free_ship_min`,
    `shipping_time`, `price_breaks`, `price_range`, `listing_page` (a search or
-   category page rather than one product), and, in `llm_scraper`,
+   category page rather than one product), and, in `scraper2.py`,
    `pack_size`.
-   - `regex_scraper`: JSON-LD → `<meta>`/microdata → regex over the text after
+   - `scraper.py`: JSON-LD → `<meta>`/microdata → regex over the text after
      the product's `<h1>` → regex over the search snippet. Each step only
      fills fields that are still empty.
-   - `llm_scraper`: the page is cut down to about 8,000 characters of visible
+   - `scraper2.py`: the page is cut down to about 8,000 characters of visible
      text around the `<h1>`. Crossed-out prices are labelled
      `[struck-out: …]`, and any JSON-LD and the search snippet are added. The
      LLM is asked for the same fields as a JSON object, and every value is
@@ -392,14 +392,14 @@ Within a group they are sorted by score (or by `effective_cost` with
 
 #### Changing the weights
 
-Every number above is a field of the `Weights` dataclass in `scrapers/ranking.py`.
+Every number above is a field of the `Weights` dataclass in `ranking.py`.
 There are three ways to change them:
 
 ```python
-# 1. Edit the defaults in scrapers/ranking.py
+# 1. Edit the defaults in ranking.py
 
 # 2. From code
-from scrapers import Scorer, Weights
+from ranking import Scorer, Weights
 scorer = Scorer(Weights(out_of_stock=2.0, per_ship_day=0.05))
 scorer.score_all(results, "LM7805", qty=50)
 top = scorer.pick_top(results, 5)
@@ -410,7 +410,7 @@ top = scorer.pick_top(results, 5)
 cat > w.json <<'EOF'
 {"out_of_stock": 2.0, "per_ship_day": 0.05, "source": {"snippet": 1.3}}
 EOF
-python -m scrapers.regex_scraper "LM7805" --weights w.json
+python scraper.py "LM7805" --weights w.json
 ```
 
 `source` entries are merged with the defaults. Any name the file doesn't
@@ -428,56 +428,39 @@ recognise, such as a typo, stops the run with an error.
 }
 ```
 
-`llm_scraper` also adds `"llm": "<provider>/<model>"`. Each result includes
+`scraper2.py` also adds `"llm": "<provider>/<model>"`. Each result includes
 every extracted field, plus `unit_cost`, `pack_size`, `packs_needed`,
 `subtotal`, `total`, `effective_cost`, `enough_stock`, `ship_days`,
 `relevance`, `mpn_variants`, `notes` and `fetch_error`.
 
 ## Project layout
 
-Run everything from the project root (`python -m ...`).
-
 ```
-pricecheck/            the price check app (python -m pricecheck)
-  listener.py            Notion webhook server -> settle -> Job Log queue -> worker
-  check.py               Checker (check one row, drain the queue) + manual CLI
-  comparison.py          Unit cost vs. the prices found (Finding)
-  alert.py               the Slack text of an alert
-  notion.py              Notion client, Purchasing columns, rows
-  joblog.py              PERBot's Job Log: the queue and alert dedup
-  slack.py               Slack client, Notion person -> Slack user matching
-  config.py              settings from the environment
-  api.py                 retries when Notion or Slack rate limit
-scrapers/              part search (also usable on its own)
-  websearch.py           search backends (Brave/Serper/Google/DuckDuckGo), page fetching
-  distributors.py        Mouser + DigiKey APIs, minimum-order maths
-  regex_scraper.py       JSON-LD / meta / regex extraction, apply_qty, CLI
-  llm_scraper.py         LLM page reading, find() (used by the price check), CLI
-  ranking.py             Weights, Scorer (score_all, pick_top), relevance, ship_days
-  env.py                 loads .env
+price_listener.py  the app: Notion webhook server -> settle -> Job Log queue -> checks
+price_check.py     the check: compare with Unit cost, Slack DM, Job Log queue helpers, CLI
+render.yaml        Render web service for the listener
+scraper2.py        part search with LLM page reading (find()), LLM client
+scraper.py         search backends, page fetching, regex/JSON-LD extraction, CLI
+distributors.py    Mouser + DigiKey API lookups, minimum-order maths
+ranking.py         Weights, Scorer (score_all, pick_top), relevance, ship_days
 tests/
-  test_listener.py       webhook signature/routing, settling, rate limit, worker, end to end
-  test_price_check.py    row parsing, price comparison, identity, alerts (all faked)
-  test_cli.py            the scraper and price check command lines end to end
-  test_regex_scraper.py  extraction, shipping, fetching and ranking regressions
-  test_search.py         search backends, search(), page fetching and parsing
-  test_llm_scraper.py    page cleanup, LLM reply validation, LLM client (faked)
-  test_ranking.py        Weights / Scorer / --weights files
-  test_distributors.py   Mouser / DigiKey parsing and ranking (APIs faked)
-render.yaml            Render web service for the listener
-pyproject.toml         pytest settings
+  test_listener.py      webhook signature/routing, settling, rate limit, worker, end to end
+  test_price_check.py   row parsing, price comparison, identity, alerts (all faked)
+  test_scraper.py    extraction, shipping, fetching and ranking regressions
+  test_search.py     search backends (Brave/Serper/Google/DuckDuckGo), search(), page parsing
+  test_cli.py        scraper.py / scraper2.py / price_check.py command lines end to end
+  test_scraper2.py   page cleanup, LLM reply validation, LLM client (faked)
+  test_ranking.py    Weights / Scorer / --weights files
+  test_distributors.py  Mouser / DigiKey parsing and ranking (APIs faked)
 requirements.txt
 ```
-
-Each package's `__init__.py` lists what it exports (`__all__`), e.g.
-`from scrapers import find, Scorer` or `from pricecheck import Checker, Notion`.
 
 ## Tests
 
 All tests run offline. Network calls and the LLM are faked.
 
 ```bash
-pytest            # or: .venv/bin/python -m pytest
+pytest            # or: .venv/bin/python -m pytest tests
 pip install coverage && coverage run -m pytest && coverage report -m   # what's untested
 ```
 

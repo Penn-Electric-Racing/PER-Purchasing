@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-listener.py - price-check Purchasing rows as they're added or edited (Notion webhooks).
+price_listener.py - price-check Purchasing rows as they're added or edited (Notion webhooks).
 
 Notion calls POST /notion/webhook when a page is created or its properties change, however
 the row was added (PERBot's /parts, typed into Notion, imported). For the Purchasing data
@@ -9,18 +9,18 @@ source:
   1. Settle: the row is read PRICE_LISTENER_SETTLE_SECONDS (default 60) after its LAST
      event, so a row typed in by hand (created empty, filled in field by field) is looked
      at once, complete. Only edits to price-relevant columns count.
-  2. Queue: if it's open and complete (notion.skip_reason) it's queued in PERBot's Job
+  2. Queue: if it's open and complete (price_check.skip_reason) it's queued in PERBot's Job
      Log as "price-check-queue <page id>", the same entry PERBot's /parts writes, so a row
      is queued once however many events or apps report it.
   3. Check: one worker drains the queue one row at a time, at most
      PRICE_LISTENER_MAX_PER_HOUR (default 20) rows an hour, with the LLM paced per minute
-     on top, and marks entries done (check.Checker). A burst of 100 new rows waits
+     on top, and marks entries done (price_check.Checker). A burst of 100 new rows waits
      its turn. If search or the LLM is failing, the row stays queued and the worker backs
      off 10 min, 20 min, ... up to 6 h.
 
 The queue lives in Notion, so a restart loses nothing that was queued. On startup the
 worker first queues rows created in the last PRICE_CHECK_LOOKBACK_HOURS that were never
-queued (joblog.discover), which covers events missed while it was down; the web
+queued (price_check.discover), which covers events missed while it was down; the web
 server is already answering by then, so Render's deploy health check doesn't wait on it.
 
 Setup (once):
@@ -31,15 +31,15 @@ Setup (once):
   3. Notion sends a verification token, which this server logs. Paste it into Notion to
      verify, and set it as NOTION_WEBHOOK_SECRET (checks every event's X-Notion-Signature).
 
-Environment: everything check.py uses, plus
+Environment: everything price_check.py uses, plus
   NOTION_WEBHOOK_SECRET          the subscription's verification token
   PORT                           default 8080 (Render sets it)
   PRICE_LISTENER_SETTLE_SECONDS  default 60
   PRICE_LISTENER_MAX_PER_HOUR    default 20
 
 Usage:
-    python -m pricecheck            # serve
-    python -m pricecheck --dry-run  # log alerts instead of DMing; nothing written
+    python price_listener.py            # serve
+    python price_listener.py --dry-run  # log alerts instead of DMing; nothing written
 """
 import argparse
 import hashlib
@@ -53,20 +53,14 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
-from scrapers import llm_scraper
-from scrapers.env import load_env
-
-from .check import Checker, make_find
-from .config import Config
-from .joblog import discover, enqueue, queued
-from .notion import (COL_EXPORTED, COL_LINK, COL_NOTES, COL_PART, COL_QTY, COL_SEASON,
-                     COL_UNIT_COST, Notion, parse_row, skip_reason)
-from .slack import Slack
+import price_check as pc
+import scraper2
+from scraper import load_env
 
 EVENTS = {"page.created", "page.properties_updated", "page.undeleted"}
 # Columns whose edits can change the check (other edits are ignored).
-PRICE_COLUMNS = (COL_PART, COL_QTY, COL_UNIT_COST, COL_LINK, COL_SEASON, COL_EXPORTED,
-                 COL_NOTES)
+PRICE_COLUMNS = (pc.COL_PART, pc.COL_QTY, pc.COL_UNIT_COST, pc.COL_LINK, pc.COL_SEASON,
+                 pc.COL_EXPORTED, pc.COL_NOTES)
 POLL_SECONDS = 300            # look at the queue at least this often (PERBot adds to it too)
 RETRY_BASE_SECONDS = 600      # back off 10 min, doubling...
 RETRY_MAX_SECONDS = 6 * 3600  # ...up to 6 h
@@ -182,7 +176,7 @@ class Worker:
         self.next_poll = 0.0       # look at the queue now (startup backlog, PERBot's entries)
         self.backoff_until = 0.0
         self.failures = 0
-        self.catch_up = None       # startup: () -> page ids queued (joblog.discover)
+        self.catch_up = None       # startup: () -> page ids queued (price_check.discover)
         self.preview = []          # dry run: rows that would have been queued...
         self.seen = set()          # ...and rows already checked (nothing is marked done)
 
@@ -191,15 +185,15 @@ class Worker:
         added = 0
         for pid in self.settling.pop_due():
             try:
-                row = parse_row(self.notion.page(pid))
+                row = pc.parse_row(self.notion.page(pid))
             except RuntimeError as e:
                 log(f"{pid}: couldn't read the page ({e})")
                 continue
-            reason = skip_reason(row, self.cfg)
+            reason = pc.skip_reason(row, self.cfg)
             if reason:
                 log(f"{pid} ({row.part_number or 'no part number'}): not queued, {reason}")
                 continue
-            new = True if self.dry_run else enqueue(self.notion, self.cfg, pid)
+            new = True if self.dry_run else pc.enqueue(self.notion, self.cfg, pid)
             if new:
                 added += 1
                 if self.dry_run:
@@ -217,7 +211,7 @@ class Worker:
         now = self.clock()
         if now < self.backoff_until or now < self.next_poll or self.limit.wait() > 0:
             return None
-        entries = [e for e in queued(self.notion, self.cfg, len(self.seen) + 1)
+        entries = [e for e in pc.queued(self.notion, self.cfg, len(self.seen) + 1)
                    if e[1] not in self.seen][:1]
         if not entries and self.preview:
             entries = [(None, self.preview.pop(0))]
@@ -305,18 +299,17 @@ def make_handler(router, secret, status):
 
 
 def main():
-    p = argparse.ArgumentParser(
-        prog="python -m pricecheck",
-        description="Price-check Purchasing rows as Notion reports them added or edited.")
+    p = argparse.ArgumentParser(description="Price-check Purchasing rows as Notion reports "
+                                            "them added or edited.")
     p.add_argument("--dry-run", action="store_true",
                    help="log alerts instead of DMing; nothing written to Notion")
-    p.add_argument("--provider", choices=list(llm_scraper.PROVIDERS), help="LLM provider")
+    p.add_argument("--provider", choices=list(scraper2.PROVIDERS), help="LLM provider")
     p.add_argument("--model", help="LLM model id")
     p.add_argument("--rpm", type=float, default=15, help="max LLM requests per minute")
     p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args()
     load_env()
-    cfg = Config.from_env(need_slack=not a.dry_run)
+    cfg = pc.Config.from_env(need_slack=not a.dry_run)
     if not cfg.job_log_ds:
         sys.exit("NOTION_JOB_LOG_DS_ID is empty: the queue lives in the Job Log.")
     secret = (os.getenv("NOTION_WEBHOOK_SECRET") or "").strip()
@@ -324,21 +317,21 @@ def main():
     per_hour = int(os.getenv("PRICE_LISTENER_MAX_PER_HOUR") or 20)
     port = int(os.getenv("PORT") or 8080)
     try:
-        llm = llm_scraper.LLM(a.provider, a.model, a.rpm, a.verbose)
-    except llm_scraper.LLMError as e:
+        llm = scraper2.LLM(a.provider, a.model, a.rpm, a.verbose)
+    except scraper2.LLMError as e:
         sys.exit(str(e))
 
-    notion = Notion(cfg.notion_token, cfg.notion_version)
-    slack = Slack(cfg.slack_token) if cfg.slack_token else None
+    notion = pc.Notion(cfg.notion_token, cfg.notion_version)
+    slack = pc.Slack(cfg.slack_token) if cfg.slack_token else None
     source = notion.data_source(cfg.purchasing_ds)
     settling = Settling()
     router = Router(cfg, settling, settle, [(source.get("parent") or {}).get("database_id")],
                     relevant_property_ids(source.get("properties", {})))
-    checker = Checker(cfg, notion, slack, make_find(llm, cfg, a.verbose), a.dry_run, a.verbose)
+    checker = pc.Checker(cfg, notion, slack, pc.make_find(llm, cfg, a.verbose), a.dry_run, a.verbose)
     worker = Worker(cfg, notion, checker, settling, HourlyLimit(per_hour), dry_run=a.dry_run)
 
     # Catch up on rows added while the listener wasn't running (in the worker thread).
-    worker.catch_up = lambda: discover(notion, cfg, dry_run=a.dry_run)
+    worker.catch_up = lambda: pc.discover(notion, cfg, dry_run=a.dry_run)
     threading.Thread(target=worker.run, daemon=True).start()
 
     def status():

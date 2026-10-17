@@ -1,14 +1,17 @@
-"""Offline tests for scrapers/distributors.py: the Mouser and DigiKey APIs are faked.
+"""Offline tests for distributors.py: the Mouser and DigiKey APIs are faked.
 
     pip install requests beautifulsoup4 pytest
     pytest
 """
+import os
+import sys
 
 import pytest
 
-from scrapers import distributors as d
-from scrapers import ranking as rk
-from scrapers import regex_scraper
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import distributors as d  # noqa: E402
+import ranking as rk  # noqa: E402
+import scraper  # noqa: E402
 
 
 class FakeResponse:
@@ -120,7 +123,7 @@ def test_missing_keys_skip_quietly(monkeypatch):
 
 def test_minimum_order_sets_quantity_bought(keys):
     reel = d.mouser("LM7805", qty=10)[1]
-    r = regex_scraper.apply_qty(reel, 10)
+    r = scraper.apply_qty(reel, 10)
     assert r["packs_needed"] == 2500 and r["subtotal"] == 750.0
 
 
@@ -153,7 +156,7 @@ def test_api_sites_dropped_from_web_results():
 def test_api_results_rank_with_price_breaks(keys):
     api, used = d.lookup("LM7805", qty=50, n=10)
     assert used == ["mouser", "digikey"]
-    rs = [regex_scraper.apply_qty(r, 50) for r in api]
+    rs = [scraper.apply_qty(r, 50) for r in api]
     rk.Scorer().score_all(rs, "LM7805", 50)
     top = rk.Scorer.pick_top(rs, 2)
     assert top[0]["supplier"] == "DigiKey" and top[0]["subtotal"] == 27.5   # 50 @ 0.55

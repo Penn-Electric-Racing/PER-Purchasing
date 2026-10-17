@@ -1,16 +1,17 @@
-"""Offline regression tests for scrapers/regex_scraper.py: no network calls.
+"""Offline regression tests for scraper.py: no network calls.
 
     pip install requests beautifulsoup4 pytest
     pytest
 """
 import json
 import os
+import sys
 
 import pytest
 from bs4 import BeautifulSoup
 
-from scrapers import regex_scraper as s
-from scrapers.ranking import relevance, ship_days
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import scraper as s  # noqa: E402
 
 
 def text_info(text, listing=False):
@@ -117,7 +118,7 @@ def test_apply_qty_frees_shipping_only_above_threshold():
 @pytest.mark.parametrize("text,days", [("72 hours", 3), ("24 hours", 1), ("2 hours", 1),
                                        ("3-5 business days", 5), ("2 weeks", 14)])
 def test_ship_days(text, days):
-    assert ship_days(text) == days
+    assert s.ship_days(text) == days
 
 
 # ---------------------------------------------------------------- fetching
@@ -160,13 +161,13 @@ def test_parse_errors_stay_on_their_page(monkeypatch):
 
 # ---------------------------------------------------------------- ranking
 def test_exact_part_number_has_no_variants():
-    _, key_hit, variants = relevance("LM317", {"title": "LM317 regulator TO-220",
+    _, key_hit, variants = s.relevance("LM317", {"title": "LM317 regulator TO-220",
                                                  "snippet": "", "url": "https://x.com/lm317"})
     assert key_hit and variants == []
 
 
 def test_longer_part_number_is_flagged_as_variant():
-    _, key_hit, variants = relevance("LM317", {"title": "LM317L regulator TO-92",
+    _, key_hit, variants = s.relevance("LM317", {"title": "LM317L regulator TO-92",
                                                  "snippet": "", "url": "https://x.com/p/1"})
     assert key_hit and variants == ["LM317L"]
 

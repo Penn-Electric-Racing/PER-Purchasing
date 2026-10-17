@@ -1,4 +1,4 @@
-"""Offline tests for pricecheck/listener.py: settling, rate limit, webhook routing, the worker
+"""Offline tests for price_listener.py: settling, rate limit, webhook routing, the worker
 (queueing into the Job Log and draining it), and the HTTP endpoint on a real local server.
 Notion, Slack and the price check itself are faked.
 
@@ -8,6 +8,7 @@ Notion, Slack and the price check itself are faked.
 import hashlib
 import hmac
 import json
+import os
 import sys
 import threading
 import urllib.error
@@ -15,13 +16,12 @@ import urllib.request
 
 import pytest
 
-import pricecheck as pc
-from pricecheck import listener as pl
-from pricecheck.config import DEFAULT_PURCHASING_DS
-from scrapers.ranking import Scorer
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import price_check as pc  # noqa: E402
+import price_listener as pl  # noqa: E402
 
 CFG = pc.Config(notion_token="n", slack_token="s")
-DS = DEFAULT_PURCHASING_DS
+DS = pc.DEFAULT_PURCHASING_DS
 
 
 class Clock:
@@ -358,9 +358,9 @@ def test_main_catches_up_then_serves(monkeypatch, capsys):
             return {"parent": {"database_id": "db1"}, "properties": {"Quant.": {"id": "q"}}}
 
     started, served = [], []
-    monkeypatch.setattr(pl.llm_scraper, "LLM", LLM)
-    monkeypatch.setattr(pl, "Notion", Notion)
-    monkeypatch.setattr(pl, "discover", lambda notion, cfg, dry_run=False: ["old1", "old2"])
+    monkeypatch.setattr(pl.scraper2, "LLM", LLM)
+    monkeypatch.setattr(pl.pc, "Notion", Notion)
+    monkeypatch.setattr(pl.pc, "discover", lambda notion, cfg, dry_run=False: ["old1", "old2"])
     monkeypatch.setattr(pl.threading, "Thread", lambda target, daemon: type(
         "T", (), {"start": lambda self: started.append(target)})())
 
@@ -371,7 +371,7 @@ def test_main_catches_up_then_serves(monkeypatch, capsys):
         def serve_forever(self):
             pass
     monkeypatch.setattr(pl, "ThreadingHTTPServer", Server)
-    monkeypatch.setattr(sys, "argv", ["pricecheck"])
+    monkeypatch.setattr(sys, "argv", ["price_listener.py"])
     pl.main()
     assert served == [("", 0)] and len(started) == 1    # serving without waiting on catch-up
     err = capsys.readouterr().err
@@ -387,7 +387,7 @@ def test_main_needs_the_job_log(monkeypatch):
     monkeypatch.setattr(pl, "load_env", lambda *a: None)
     monkeypatch.setenv("NOTION_TOKEN", "n")
     monkeypatch.setenv("NOTION_JOB_LOG_DS_ID", "")
-    monkeypatch.setattr(sys, "argv", ["pricecheck", "--dry-run"])
+    monkeypatch.setattr(sys, "argv", ["price_listener.py", "--dry-run"])
     with pytest.raises(SystemExit, match="Job Log"):
         pl.main()
 
@@ -426,8 +426,8 @@ class E2ESlack:
 
 
 def pipeline(pages, per_hour=20, price=2.0):
-    """Router + Worker + a real check.Checker over fake Notion / Slack / search."""
-    from scrapers import regex_scraper
+    """Router + Worker + a real price_check.Checker over fake Notion / Slack / search."""
+    import scraper
     clock = Clock()
     notion = E2ENotion(pages)
     notion.done_keys = set()
@@ -437,11 +437,11 @@ def pipeline(pages, per_hour=20, price=2.0):
     def find(row):
         searched.append(row.id)
         r = {"title": "LM7805", "url": f"https://shop.com/{row.id}", "snippet": "", "search_rank": 0,
-             **regex_scraper._blank_info(), "cost": price, "currency": "USD", "cost_source": "llm",
+             **scraper._blank_info(), "cost": price, "currency": "USD", "cost_source": "llm",
              "supplier": "shop.com", "in_stock": True, "shipping_cost": "Free",
              "shipping_time": "2 days"}
-        rs = [regex_scraper.apply_qty(r, row.units)]
-        Scorer().score_all(rs, row.part_number, row.units)
+        rs = [scraper.apply_qty(r, row.units)]
+        pc.Scorer().score_all(rs, row.part_number, row.units)
         return rs
     checker = pc.Checker(CFG, notion, slack, find)
     settling = pl.Settling(clock)
@@ -542,9 +542,9 @@ def test_main_exits_without_an_llm(monkeypatch):
     _main_env(monkeypatch)
 
     def no_llm(*a, **k):
-        raise pl.llm_scraper.LLMError("no LLM configured")
-    monkeypatch.setattr(pl.llm_scraper, "LLM", no_llm)
-    monkeypatch.setattr(sys, "argv", ["pricecheck"])
+        raise pl.scraper2.LLMError("no LLM configured")
+    monkeypatch.setattr(pl.scraper2, "LLM", no_llm)
+    monkeypatch.setattr(sys, "argv", ["price_listener.py"])
     with pytest.raises(SystemExit, match="no LLM configured"):
         pl.main()
 
@@ -568,14 +568,14 @@ def test_main_dry_run_previews_startup_rows(monkeypatch, capsys):
             return {"parent": {}, "properties": {}}
 
     calls = []
-    monkeypatch.setattr(pl.llm_scraper, "LLM", LLM)
-    monkeypatch.setattr(pl, "Notion", Notion)
-    monkeypatch.setattr(pl, "discover", lambda notion, cfg, dry_run=False: calls.append(dry_run) or ["old1"])
+    monkeypatch.setattr(pl.scraper2, "LLM", LLM)
+    monkeypatch.setattr(pl.pc, "Notion", Notion)
+    monkeypatch.setattr(pl.pc, "discover", lambda notion, cfg, dry_run=False: calls.append(dry_run) or ["old1"])
     monkeypatch.setattr(pl.threading, "Thread", lambda target, daemon: workers.append(target.__self__) or
                         type("T", (), {"start": lambda self: None})())
     monkeypatch.setattr(pl, "ThreadingHTTPServer", lambda addr, handler: type(
         "S", (), {"serve_forever": lambda self: None})())
-    monkeypatch.setattr(sys, "argv", ["pricecheck", "--dry-run"])
+    monkeypatch.setattr(sys, "argv", ["price_listener.py", "--dry-run"])
     pl.main()
     w = workers[0]
     assert calls == [] and w.dry_run                      # catch-up hasn't run yet

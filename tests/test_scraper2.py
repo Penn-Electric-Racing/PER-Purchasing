@@ -1,13 +1,16 @@
-"""Offline tests for scrapers/llm_scraper.py: no network calls, the LLM is faked.
+"""Offline tests for scraper2.py: no network calls, the LLM is faked.
 
     pip install requests beautifulsoup4 pytest
     pytest
 """
+import os
+import sys
 
 import pytest
 
-from scrapers import llm_scraper as s
-from scrapers.ranking import Scorer
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import scraper2 as s  # noqa: E402
+from ranking import Scorer  # noqa: E402
 
 PAGE = """<html><head>
 <script type="application/ld+json">{"@type": "Product", "name": "LM7805",

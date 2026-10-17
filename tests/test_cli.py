@@ -1,18 +1,21 @@
-"""Offline tests for the command-line entry points: regex_scraper.main, llm_scraper.find/main and
-pricecheck.check.main. Search, page fetches, the LLM, Notion and Slack are all faked, and
+"""Offline tests for the command-line entry points: scraper.main, scraper2.find/main and
+price_check.main. Search, page fetches, the LLM, Notion and Slack are all faked, and
 load_env is disabled so the real .env keys are never read.
 
     pip install requests beautifulsoup4 pytest
     pytest
 """
 import json
+import os
 import sys
 
 import pytest
 
-from pricecheck import check
-from pricecheck.config import DEFAULT_PURCHASING_DS
-from scrapers import distributors, llm_scraper, regex_scraper, websearch
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import distributors  # noqa: E402
+import price_check as pc  # noqa: E402
+import scraper  # noqa: E402
+import scraper2  # noqa: E402
 
 HITS = [{"title": "LM7805 regulator", "url": "https://a.com/lm7805", "snippet": "LM7805 $0.89",
          "search_rank": 0},
@@ -33,11 +36,11 @@ def api_part(cost=0.75):
 @pytest.fixture(autouse=True)
 def offline(monkeypatch):
     """No .env, no real network: tests opt in to each fake they need."""
-    monkeypatch.setattr(regex_scraper, "load_env", lambda *a: None)
-    monkeypatch.setattr(llm_scraper, "load_env", lambda *a: None)
-    monkeypatch.setattr(check, "load_env", lambda *a: None)
+    monkeypatch.setattr(scraper, "load_env", lambda *a: None)
+    monkeypatch.setattr(scraper2, "load_env", lambda *a: None)
+    monkeypatch.setattr(pc, "load_env", lambda *a: None)
     monkeypatch.setattr(distributors, "lookup", lambda *a, **k: ([], []))
-    monkeypatch.setattr(websearch.time, "sleep", lambda t: None)
+    monkeypatch.setattr(scraper.time, "sleep", lambda t: None)
 
 
 def run(module, monkeypatch, *argv):
@@ -57,62 +60,62 @@ def fake_search(monkeypatch, module, hits=HITS, error=None):
     return calls
 
 
-# ---------------------------------------------------------------- regex_scraper
-def test_regex_scraper_no_fetch_text_output(monkeypatch, capsys):
-    calls = fake_search(monkeypatch, regex_scraper)
-    run(regex_scraper, monkeypatch, "LM7805", "-q", "10", "--no-fetch", "-n", "2")
+# ---------------------------------------------------------------- scraper.py
+def test_scraper_no_fetch_text_output(monkeypatch, capsys):
+    calls = fake_search(monkeypatch, scraper)
+    run(scraper, monkeypatch, "LM7805", "-q", "10", "--no-fetch", "-n", "2")
     out = capsys.readouterr().out
     assert calls == [("LM7805 price", 30, ("buy LM7805", "LM7805 in stock"))]
     assert out.startswith('Best 2 of 3 results for "LM7805"  x10  (via fake;')
     assert "1. LM7805 10pcs" in out and "1 pack(s) of 10 = 4.00 USD" in out  # 0.40/unit beats 0.89
 
 
-def test_regex_scraper_json_and_exact(monkeypatch, capsys):
-    calls = fake_search(monkeypatch, regex_scraper)
-    monkeypatch.setattr(regex_scraper, "enrich", lambda rs: [
-        {**r, **regex_scraper._blank_info(), "cost": 1.0, "currency": "USD", "cost_source": "json-ld",
+def test_scraper_json_and_exact(monkeypatch, capsys):
+    calls = fake_search(monkeypatch, scraper)
+    monkeypatch.setattr(scraper, "enrich", lambda rs: [
+        {**r, **scraper._blank_info(), "cost": 1.0, "currency": "USD", "cost_source": "json-ld",
          "supplier": r["url"].split("/")[2]} for r in rs])
-    run(regex_scraper, monkeypatch, "LM7805", "--exact", "--json", "--rank", "cheapest")
+    run(scraper, monkeypatch, "LM7805", "--exact", "--json", "--rank", "cheapest")
     data = json.loads(capsys.readouterr().out)
     assert calls[0] == ("LM7805", 30, ())
     assert data["query"] == "LM7805" and data["rank"] == "cheapest" and data["priced"] == 3
     assert len(data["results"]) == 3 and data["results"][0]["total"] is None
 
 
-def test_regex_scraper_adds_api_results_and_drops_their_site(monkeypatch, capsys):
-    fake_search(monkeypatch, regex_scraper)
+def test_scraper_adds_api_results_and_drops_their_site(monkeypatch, capsys):
+    fake_search(monkeypatch, scraper)
     monkeypatch.setattr(distributors, "lookup", lambda *a, **k: ([api_part()], ["mouser"]))
     fetched = []
-    monkeypatch.setattr(regex_scraper, "enrich", lambda rs: fetched.extend(rs) or
-                        [{**r, **regex_scraper._blank_info(), "supplier": "x"} for r in rs])
-    run(regex_scraper, monkeypatch, "LM7805", "--json")
+    monkeypatch.setattr(scraper, "enrich", lambda rs: fetched.extend(rs) or
+                        [{**r, **scraper._blank_info(), "supplier": "x"} for r in rs])
+    run(scraper, monkeypatch, "LM7805", "--json")
     data = json.loads(capsys.readouterr().out)
     assert "www.mouser.com" not in " ".join(r["url"] for r in fetched)  # API replaces the page
     assert data["source"] == "fake + mouser api" and data["results"][0]["cost_source"] == "api"
 
 
-def test_regex_scraper_api_only_when_search_fails(monkeypatch, capsys):
-    fake_search(monkeypatch, regex_scraper, error="All backends failed: HTTP 202")
+def test_scraper_api_only_when_search_fails(monkeypatch, capsys):
+    fake_search(monkeypatch, scraper, error="All backends failed: HTTP 202")
     monkeypatch.setattr(distributors, "lookup", lambda *a, **k: ([api_part()], ["mouser"]))
-    run(regex_scraper, monkeypatch, "LM7805", "--json")
+    run(scraper, monkeypatch, "LM7805", "--json")
     data = json.loads(capsys.readouterr().out)
     assert data["source"] == "mouser api" and data["candidates"] == 1
 
 
-def test_regex_scraper_exits_with_help_when_everything_fails(monkeypatch):
-    fake_search(monkeypatch, regex_scraper, error="All backends failed: HTTP 202")
+def test_scraper_exits_with_help_when_everything_fails(monkeypatch):
+    fake_search(monkeypatch, scraper, error="All backends failed: HTTP 202")
     with pytest.raises(SystemExit, match="SERPER_API_KEY"):
-        run(regex_scraper, monkeypatch, "LM7805")
+        run(scraper, monkeypatch, "LM7805")
 
 
 @pytest.mark.parametrize("argv", [["x", "-q", "0"], ["x", "-n", "5", "--pool", "2"],
                                   ["x", "--api", "-1"], ["x", "--weights", "/no/such.json"]])
-def test_regex_scraper_rejects_bad_arguments(monkeypatch, argv):
+def test_scraper_rejects_bad_arguments(monkeypatch, argv):
     with pytest.raises(SystemExit):
-        run(regex_scraper, monkeypatch, *argv)
+        run(scraper, monkeypatch, *argv)
 
 
-# ---------------------------------------------------------------- llm_scraper.find / main
+# ---------------------------------------------------------------- scraper2.find / main
 class FakeLLM:
     provider, model = "fake", "fake-model"
 
@@ -129,10 +132,10 @@ class FakeLLM:
 
 
 def test_find_reads_extra_links_and_dedupes(monkeypatch):
-    fake_search(monkeypatch, llm_scraper)
-    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: "<h1>LM7805</h1>")
+    fake_search(monkeypatch, scraper2)
+    monkeypatch.setattr(scraper2, "_fetch_html", lambda url: "<h1>LM7805</h1>")
     llm = FakeLLM()
-    _, source, results = llm_scraper.find("LM7805", 5, llm, batch=1, extra=[
+    _, source, results = scraper2.find("LM7805", 5, llm, batch=1, extra=[
         {"title": "mine", "url": "https://mine.com/p"}, {"title": "dup", "url": HITS[0]["url"]}])
     urls = [r["url"] for r in results]
     assert urls.count(HITS[0]["url"]) == 1 and "https://mine.com/p" in urls
@@ -141,49 +144,49 @@ def test_find_reads_extra_links_and_dedupes(monkeypatch):
 
 
 def test_find_with_only_extra_links_when_search_fails(monkeypatch):
-    fake_search(monkeypatch, llm_scraper, error="All backends failed")
-    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: "<h1>x</h1>")
-    _, source, results = llm_scraper.find("LM7805", 1, FakeLLM(), extra=[{"title": "m", "url": "https://m.com"}])
+    fake_search(monkeypatch, scraper2, error="All backends failed")
+    monkeypatch.setattr(scraper2, "_fetch_html", lambda url: "<h1>x</h1>")
+    _, source, results = scraper2.find("LM7805", 1, FakeLLM(), extra=[{"title": "m", "url": "https://m.com"}])
     assert source == "none" and [r["url"] for r in results] == ["https://m.com"]
-    fake_search(monkeypatch, llm_scraper, error="All backends failed")
+    fake_search(monkeypatch, scraper2, error="All backends failed")
     with pytest.raises(RuntimeError):
-        llm_scraper.find("LM7805", 1, FakeLLM())
+        scraper2.find("LM7805", 1, FakeLLM())
 
 
-def test_llm_scraper_main_json(monkeypatch, capsys):
-    fake_search(monkeypatch, llm_scraper)
-    monkeypatch.setattr(llm_scraper, "LLM", FakeLLM)
-    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: "<h1>LM7805</h1>")
-    run(llm_scraper, monkeypatch, "LM7805", "--json", "--batch", "3")
+def test_scraper2_main_json(monkeypatch, capsys):
+    fake_search(monkeypatch, scraper2)
+    monkeypatch.setattr(scraper2, "LLM", FakeLLM)
+    monkeypatch.setattr(scraper2, "_fetch_html", lambda url: "<h1>LM7805</h1>")
+    run(scraper2, monkeypatch, "LM7805", "--json", "--batch", "3")
     data = json.loads(capsys.readouterr().out)
     assert data["llm"] == "fake/fake-model" and data["priced"] == 3
 
 
-def test_llm_scraper_main_no_fetch_text(monkeypatch, capsys):
-    fake_search(monkeypatch, llm_scraper)
-    monkeypatch.setattr(llm_scraper, "LLM", FakeLLM)
-    run(llm_scraper, monkeypatch, "LM7805", "--no-fetch", "-n", "1")
+def test_scraper2_main_no_fetch_text(monkeypatch, capsys):
+    fake_search(monkeypatch, scraper2)
+    monkeypatch.setattr(scraper2, "LLM", FakeLLM)
+    run(scraper2, monkeypatch, "LM7805", "--no-fetch", "-n", "1")
     out = capsys.readouterr().out
     assert "via fake + fake/fake-model" in out and "Cost:          1.00 USD  (llm snippet)" in out
 
 
-def test_llm_scraper_main_errors(monkeypatch):
+def test_scraper2_main_errors(monkeypatch):
     def no_llm(*a, **k):
-        raise llm_scraper.LLMError("no LLM configured")
-    monkeypatch.setattr(llm_scraper, "LLM", no_llm)
+        raise scraper2.LLMError("no LLM configured")
+    monkeypatch.setattr(scraper2, "LLM", no_llm)
     with pytest.raises(SystemExit, match="no LLM configured"):
-        run(llm_scraper, monkeypatch, "LM7805")
-    monkeypatch.setattr(llm_scraper, "LLM", FakeLLM)
+        run(scraper2, monkeypatch, "LM7805")
+    monkeypatch.setattr(scraper2, "LLM", FakeLLM)
     with pytest.raises(SystemExit):
-        run(llm_scraper, monkeypatch, "LM7805", "--batch", "0")
-    fake_search(monkeypatch, llm_scraper, error="All backends failed")
+        run(scraper2, monkeypatch, "LM7805", "--batch", "0")
+    fake_search(monkeypatch, scraper2, error="All backends failed")
     with pytest.raises(SystemExit, match="All backends failed"):
-        run(llm_scraper, monkeypatch, "LM7805")
+        run(scraper2, monkeypatch, "LM7805")
 
 
-# ---------------------------------------------------------------- pricecheck.check.main
+# ---------------------------------------------------------------- price_check.main
 ROW = {"id": "row1", "url": "https://www.notion.so/row1",
-       "parent": {"type": "data_source_id", "data_source_id": DEFAULT_PURCHASING_DS},
+       "parent": {"type": "data_source_id", "data_source_id": pc.DEFAULT_PURCHASING_DS},
        "properties": {
     "Season": {"select": {"name": "REV12"}}, "Exported?": {"checkbox": False},
     "Name": {"type": "title", "title": [{"plain_text": "5V regulator"}]},
@@ -195,7 +198,7 @@ ROW = {"id": "row1", "url": "https://www.notion.so/row1",
 
 
 class FakeNotionAPI:
-    """Stands in for pricecheck.Notion (constructed by main)."""
+    """Stands in for price_check.Notion (constructed by main)."""
     instances = []
 
     entries = []
@@ -249,25 +252,25 @@ def notion_env(monkeypatch):
     FakeNotionAPI.instances.clear()
     FakeNotionAPI.entries = []
     FakeSlackAPI.posts.clear()
-    monkeypatch.setattr(check, "Notion", FakeNotionAPI)
-    monkeypatch.setattr(check, "Slack", FakeSlackAPI)
-    monkeypatch.setattr(llm_scraper, "LLM", FakeLLM)
+    monkeypatch.setattr(pc, "Notion", FakeNotionAPI)
+    monkeypatch.setattr(pc, "Slack", FakeSlackAPI)
+    monkeypatch.setattr(scraper2, "LLM", FakeLLM)
     searched = []
 
     def find(base, qty, llm, pool=15, extra=(), verbose=False, **k):
         searched.append((base, qty, [e["url"] for e in extra]))
         r = {"title": "LM7805", "url": "https://a.com/lm7805", "snippet": "", "search_rank": 0,
-             **regex_scraper._blank_info(), "cost": 2.0, "currency": "USD", "cost_source": "llm",
+             **scraper._blank_info(), "cost": 2.0, "currency": "USD", "cost_source": "llm",
              "supplier": "a.com", "in_stock": True}
-        rs = [llm_scraper.apply_qty(r, qty)]
-        llm_scraper.Scorer().score_all(rs, base, qty)
+        rs = [scraper2.apply_qty(r, qty)]
+        scraper2.Scorer().score_all(rs, base, qty)
         return "LM7805 price", "fake", rs
-    monkeypatch.setattr(llm_scraper, "find", find)
+    monkeypatch.setattr(scraper2, "find", find)
     return searched
 
 
 def test_price_check_sweep_alerts(monkeypatch, notion_env, capsys):
-    run(check, monkeypatch, "--all", "--limit", "5")
+    run(pc, monkeypatch, "--all", "--limit", "5")
     notion = FakeNotionAPI.instances[0]
     assert notion.limits == [5]
     assert notion_env == [("LM7805", 10, ["https://a.com/lm7805"])]
@@ -277,7 +280,7 @@ def test_price_check_sweep_alerts(monkeypatch, notion_env, capsys):
 
 
 def test_price_check_single_row_dry_run(monkeypatch, notion_env):
-    run(check, monkeypatch, "--row", "https://www.notion.so/X-0123456789abcdef0123456789abcdef",
+    run(pc, monkeypatch, "--row", "https://www.notion.so/X-0123456789abcdef0123456789abcdef",
         "--dry-run")
     assert FakeSlackAPI.posts == [] and FakeNotionAPI.instances[0].created == []
 
@@ -285,7 +288,7 @@ def test_price_check_single_row_dry_run(monkeypatch, notion_env):
 def test_price_check_queue_drains_entries(monkeypatch, notion_env, capsys):
     FakeNotionAPI.entries = [("e1", "row1")]
     monkeypatch.setenv("PRICE_CHECK_BATCH", "4")
-    run(check, monkeypatch, "--queue")
+    run(pc, monkeypatch, "--queue")
     notion = FakeNotionAPI.instances[0]
     assert notion.limits == [None, 4] and notion.done == ["e1"]  # discovery, then the queue
     assert len(notion.created) == 2  # row1 discovered + queued, then its alert claim
@@ -294,7 +297,7 @@ def test_price_check_queue_drains_entries(monkeypatch, notion_env, capsys):
 
 
 def test_price_check_queue_dry_run_previews_discovered_rows(monkeypatch, notion_env, capsys):
-    run(check, monkeypatch, "--queue", "--dry-run")
+    run(pc, monkeypatch, "--queue", "--dry-run")
     notion = FakeNotionAPI.instances[0]
     assert notion.created == [] and notion.done == []  # nothing written
     assert notion_env and "1 new row(s) would be queued" in capsys.readouterr().err
@@ -302,14 +305,14 @@ def test_price_check_queue_dry_run_previews_discovered_rows(monkeypatch, notion_
 
 def test_price_check_empty_queue_skips_the_llm(monkeypatch, notion_env, capsys):
     monkeypatch.setenv("PRICE_CHECK_LOOKBACK_HOURS", "0")  # no discovery
-    monkeypatch.setattr(llm_scraper, "LLM", lambda *a, **k: (_ for _ in ()).throw(AssertionError("LLM used")))
-    run(check, monkeypatch, "--queue")
+    monkeypatch.setattr(scraper2, "LLM", lambda *a, **k: (_ for _ in ()).throw(AssertionError("LLM used")))
+    run(pc, monkeypatch, "--queue")
     assert "queue is empty" in capsys.readouterr().err and notion_env == []
 
 
 def test_price_check_enqueue(monkeypatch, notion_env, capsys):
     monkeypatch.delenv("SLACK_BOT_TOKEN")  # not needed to queue
-    run(check, monkeypatch, "--enqueue", "https://www.notion.so/X-0123456789abcdef0123456789abcdef")
+    run(pc, monkeypatch, "--enqueue", "https://www.notion.so/X-0123456789abcdef0123456789abcdef")
     assert FakeNotionAPI.instances[0].created[0]["Run key"]["title"][0]["text"]["content"] == \
         "price-check-queue 0123456789abcdef0123456789abcdef"
     assert "queued" in capsys.readouterr().err
@@ -317,14 +320,14 @@ def test_price_check_enqueue(monkeypatch, notion_env, capsys):
 
 def test_price_check_needs_row_or_all(monkeypatch, notion_env):
     with pytest.raises(SystemExit):
-        run(check, monkeypatch)
+        run(pc, monkeypatch)
 
 
 def test_price_check_main_requires_tokens(monkeypatch):
     for k in ("NOTION_TOKEN", "NOTION_API_KEY", "SLACK_BOT_TOKEN"):
         monkeypatch.delenv(k, raising=False)
     with pytest.raises(SystemExit, match="NOTION_TOKEN / NOTION_API_KEY"):
-        run(check, monkeypatch, "--all")
+        run(pc, monkeypatch, "--all")
     monkeypatch.setenv("NOTION_API_KEY", "n")
     with pytest.raises(SystemExit, match="SLACK_BOT_TOKEN"):
-        run(check, monkeypatch, "--all")
+        run(pc, monkeypatch, "--all")

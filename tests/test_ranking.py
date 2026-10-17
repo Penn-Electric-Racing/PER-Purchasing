@@ -1,23 +1,26 @@
-"""Offline tests for scrapers/ranking.py's Weights / Scorer.
+"""Offline tests for ranking.py's Weights / Scorer.
 
     pip install requests beautifulsoup4 pytest
     pytest
 """
 import json
+import os
+import sys
 
 import pytest
 
-from scrapers import ranking as rk
-from scrapers import regex_scraper
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import ranking as rk  # noqa: E402
+import scraper  # noqa: E402
 
 
 def candidate(i, cost, **kw):
     r = {"title": "LM7805 voltage regulator", "url": f"https://site{i}.com/p/{i}",
-         "snippet": "", "search_rank": i, **regex_scraper._blank_info()}
+         "snippet": "", "search_rank": i, **scraper._blank_info()}
     r.update(cost=cost, cost_source="json-ld", supplier=f"site{i}", in_stock=True,
              shipping_cost="Free", shipping_time="2 days")
     r.update(kw)
-    return regex_scraper.apply_qty(r, 1)
+    return scraper.apply_qty(r, 1)
 
 
 def test_cheapest_clean_option_scores_one():
@@ -71,8 +74,8 @@ def test_ship_value(ship, value):
 
 
 def test_scraper_uses_the_default_scorer():
-    assert regex_scraper.score_all.__self__ is regex_scraper.SCORER
-    assert regex_scraper.SCORER.w == rk.Weights()
+    assert scraper.score_all.__self__ is scraper.SCORER
+    assert scraper.SCORER.w == rk.Weights()
 
 
 def test_wrong_part_never_sets_baseline_when_all_listings_have_notes():
@@ -101,7 +104,7 @@ def test_out_of_stock_short_stock_and_slow_shipping_notes():
     short = candidate(1, 1.0, stock=0)
     slow = candidate(2, 1.0, shipping_time="3 weeks")
     rs = [out, short, slow]
-    scraper_qty = [regex_scraper.apply_qty(r, 5) for r in rs]
+    scraper_qty = [scraper.apply_qty(r, 5) for r in rs]
     rk.Scorer().score_all(scraper_qty, "LM7805", 5)
     assert "out of stock" in out["notes"]
     assert "stock below 5" in short["notes"]

@@ -1,5 +1,5 @@
 """
-distributors.py - exact price/stock data from distributor APIs (used by both scrapers).
+distributors.py - exact price/stock data from distributor APIs (used by scraper.py and scraper2.py).
 
 Mouser and DigiKey block or confuse page scraping, but both have free APIs that
 return structured part data: price breaks, stock, minimum order and lead time.
@@ -40,8 +40,8 @@ class APIError(Exception):
 
 
 def _blank():
-    # Imported here: regex_scraper imports this module, so a top-level import would be circular.
-    from .regex_scraper import _blank_info
+    # Imported here: scraper imports this module, so a top-level import would be circular.
+    from scraper import _blank_info
     return _blank_info()
 
 
@@ -85,7 +85,7 @@ def _ship_time(stock, lead):
 
 
 def _candidate(title, url, snippet, supplier, **info):
-    """A result dict in the same shape regex_scraper.part_info produces."""
+    """A result dict in the same shape scraper.part_info produces."""
     return {"title": title, "url": url, "snippet": snippet,
             **_blank(), "supplier": supplier, "cost_source": "api", **info}
 
