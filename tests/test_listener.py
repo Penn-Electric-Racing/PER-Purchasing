@@ -421,7 +421,7 @@ class E2ESlack:
     def lookup_email(self, email):
         return None
 
-    def post(self, channel, text):
+    def post(self, channel, text, blocks=None):
         self.posts.append((channel, text))
 
 

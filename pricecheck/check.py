@@ -23,7 +23,8 @@ rows and mark them done).
 The alert is a Slack DM to the row's Point of contact (Notion person -> Slack user by email,
 then an unambiguous name match, as PERBot's identity.ts does). Each alert is claimed once in
 PERBot's Job Log ("price-alert <row id> <unit cost> x<quant>"), so a row only alerts again
-after someone changes its Unit cost or Quant.
+after someone changes its Unit cost or Quant. The DM carries Use / Keep buttons whose clicks
+PERBot handles (see alert.py).
 
 Environment (same names as PERBot; .env is read too):
   NOTION_TOKEN or NOTION_API_KEY   PERBot's Notion integration token
@@ -55,7 +56,7 @@ from urllib.parse import urlparse
 from scrapers import llm_scraper
 from scrapers.env import load_env
 
-from .alert import format_alert, money
+from .alert import alert_blocks, format_alert, money
 from .comparison import compare
 from .config import Config
 from .joblog import claim_once, discover, enqueue, mark_done, queued
@@ -182,15 +183,18 @@ class Checker:
             targets = [cfg.fallback_channel]
         print(f"{label}: {f.delta_pct:+.0f}% -> {', '.join(targets) or 'nobody to DM'}",
               file=sys.stderr)
+        blocks = alert_blocks(f, text)
         if self.dry_run:
-            print(text + "\n")
+            buttons = blocks[1]["elements"] if len(blocks) > 1 else []
+            print(text + ("\n[" + " | ".join(b["text"]["text"] for b in buttons) + "]"
+                          if buttons else "") + "\n")
             return True
         if not targets:
             print(f"  no Slack match for {[c['name'] for c in row.contacts]} and no "
                   f"PRICE_CHECK_CHANNEL - alert not sent:\n{text}", file=sys.stderr)
         for t in targets:
             try:
-                self.slack.post(t, text)
+                self.slack.post(t, text, blocks)
             except RuntimeError as e:
                 print(f"  Slack post to {t} failed: {e}", file=sys.stderr)
         return True
