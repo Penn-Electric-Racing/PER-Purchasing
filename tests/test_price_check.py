@@ -58,6 +58,7 @@ class FakeNotion:
 
     def __init__(self, claimed=(), rows=(), entries=(), pages=None):
         self.claimed, self.created, self.rows, self.queries = set(claimed), [], list(rows), []
+        self.ledger = []
         self.entries, self.pages, self.done = list(entries), pages or {}, []
 
     def query(self, ds, filter_=None, page_size=100, sorts=None, limit=None):
@@ -70,6 +71,9 @@ class FakeNotion:
         return self.rows[:limit]  # open rows / discovery
 
     def create(self, ds, props):
+        if "Run key" not in props:   # a savings-ledger row
+            self.ledger.append(props)
+            return
         self.created.append(props["Run key"]["title"][0]["text"]["content"])
 
     def page(self, pid):
@@ -737,3 +741,76 @@ def test_use_asks_for_a_check_first():
         c = b["confirm"]
         assert len(c["title"]["text"]) <= 100 and len(c["text"]["text"]) <= 300
         assert len(c["confirm"]["text"]) <= 30 and len(c["deny"]["text"]) <= 30
+
+
+# ---------------------------------------------------------------- savings ledger
+def test_alert_is_logged_to_the_ledger_once_sent():
+    notion, slack = FakeNotion(), FakeSlack()
+    row = pc.parse_row(page(cost=1.00))
+    find = lambda r: scored(listing(r.link, 1.30), listing("https://shop.com/p", 0.80))  # noqa: E731
+    assert checker(notion, slack, find).check(row) == "alerted"
+    (props,) = notion.ledger
+    assert props["Outcome"]["select"]["name"] == "Pending"
+    assert props["Name"]["title"][0]["text"]["content"] == "5V regulator ×50"
+    assert props["Row ID"]["rich_text"][0]["text"]["content"] == "p1"
+    assert (props["Old unit cost"]["number"], props["Quant."]["number"]) == (1.0, 50)
+    # The offered price is the alert's primary (cheapest) option, with its listing.
+    assert props["Offered unit cost"]["number"] == 0.8
+    assert props["Potential $"]["number"] == 10.0          # (1.00 - 0.80) x 50
+    assert props["Direction"]["select"]["name"] == "Drop"
+    assert props["Supplier"]["rich_text"][0]["text"]["content"] == "shop.com"
+    assert props["Listing"]["url"] == "https://shop.com/p"
+    assert props["Purchasing row"]["url"] == "https://www.notion.so/p1"
+    assert props["Season"]["select"]["name"] == "REV12"
+    assert "Alert sent" in props
+
+
+def test_pack_row_ledger_is_in_notion_units():
+    row = pc.parse_row(page(qty=5, cost=10.00, notes="Sold in packs of 10"))
+    f = pc.compare(row, scored(listing(row.link, 0.80, qty=50)), CFG)
+    props = pc.ledger_props(f)
+    assert props["Offered unit cost"]["number"] == 8.0      # per pack, like Unit cost
+    assert props["Potential $"]["number"] == 10.0           # (10 - 8) x 5 packs
+    assert "Listing" in props and props["Direction"]["select"]["name"] == "Drop"
+
+
+def test_price_rise_is_logged_as_a_rise():
+    row = pc.parse_row(page(cost=1.00))
+    props = pc.ledger_props(pc.compare(row, scored(listing(row.link, 1.40)), CFG))
+    assert props["Direction"]["select"]["name"] == "Rise"
+    assert props["Potential $"]["number"] == -20.0
+    assert "Listing" in props  # the row's own link
+
+
+def test_nothing_logged_when_not_sent_or_ledger_off(capsys):
+    class Down(FakeSlack):
+        def post(self, channel, text, blocks=None):
+            raise RuntimeError("Slack chat.postMessage: not_in_channel")
+    notion = FakeNotion()
+    checker(notion, Down()).check(pc.parse_row(page()))
+    assert notion.ledger == []
+    notion = FakeNotion()
+    checker(notion, dry_run=True).check(pc.parse_row(page()))
+    assert notion.ledger == []
+    notion = FakeNotion()
+    checker(notion, cfg=pc.Config("n", "s", threshold_pct=10, ledger_ds="")).check(pc.parse_row(page()))
+    assert notion.ledger == []
+
+
+def test_ledger_failure_does_not_stop_the_alert(capsys):
+    class NoLedger(FakeNotion):
+        def create(self, ds, props):
+            if "Run key" not in props:
+                raise RuntimeError("HTTP 404 object_not_found")
+            super().create(ds, props)
+    slack = FakeSlack()
+    assert checker(NoLedger(), slack).check(pc.parse_row(page())) == "alerted"
+    assert slack.posts and "couldn't log the alert" in capsys.readouterr().err
+
+
+def test_config_ledger_env(monkeypatch):
+    monkeypatch.setenv("NOTION_TOKEN", "n")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "s")
+    assert pc.Config.from_env().ledger_ds == "dd1818e3-82cd-461b-8071-12af3b0f1341"
+    monkeypatch.setenv("PRICE_CHECK_LEDGER_DS_ID", "")
+    assert pc.Config.from_env().ledger_ds == ""

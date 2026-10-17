@@ -57,6 +57,7 @@ from scrapers import llm_scraper
 from scrapers.env import load_env
 
 from .alert import alert_blocks, format_alert, money
+from .ledger import log_alert
 from .comparison import compare
 from .config import Config
 from .joblog import claim_once, discover, enqueue, mark_done, queued
@@ -192,11 +193,15 @@ class Checker:
         if not targets:
             print(f"  no Slack match for {[c['name'] for c in row.contacts]} and no "
                   f"PRICE_CHECK_CHANNEL - alert not sent:\n{text}", file=sys.stderr)
+        sent = False
         for t in targets:
             try:
                 self.slack.post(t, text, blocks)
+                sent = True
             except RuntimeError as e:
                 print(f"  Slack post to {t} failed: {e}", file=sys.stderr)
+        if sent:
+            log_alert(self.notion, cfg, f)
         return True
 
 

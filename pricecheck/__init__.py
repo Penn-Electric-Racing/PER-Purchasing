@@ -8,6 +8,7 @@ on Slack when the price moved.
     alert.py       the Slack message of an alert (text + Use / Keep buttons)
     notion.py      Notion client, Purchasing columns and rows
     joblog.py      PERBot's Job Log: the queue and alert dedup
+    ledger.py      the savings ledger (💸 Price Check Savings): one row per alert
     slack.py       Slack client and Notion person -> Slack user matching
     config.py      settings from the environment
     api.py         HTTP retries when Notion or Slack rate limit
@@ -27,6 +28,8 @@ _EXPORTS = {
     # comparing and alerting
     "Finding": "comparison", "compare": "comparison", "format_alert": "alert", "money": "alert",
     "alert_buttons": "alert", "alert_blocks": "alert", "alert_links": "alert",
+    # the savings ledger
+    "ledger_props": "ledger", "log_alert": "ledger",
     # Notion
     "Notion": "notion", "Row": "notion", "parse_row": "notion", "skip_reason": "notion",
     "open_rows": "notion",
