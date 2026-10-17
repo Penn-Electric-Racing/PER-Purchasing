@@ -238,7 +238,7 @@ class FakeSlackAPI:
     def lookup_email(self, email):
         return None
 
-    def post(self, channel, text):
+    def post(self, channel, text, blocks=None):
         FakeSlackAPI.posts.append((channel, text))
 
 

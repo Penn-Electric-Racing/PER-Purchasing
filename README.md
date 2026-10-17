@@ -85,6 +85,14 @@ else the log. Each alert is recorded once in the Job Log as
 `price-alert <row id> <unit cost> x<quant>`, so a row alerts again only after
 its `Unit cost` or `Quant.` changes.
 
+**Buttons:** the DM has **Use $X** for the price found (and for a cheaper
+option, unless it's flagged) and **Keep $Y**. Clicks go to PERBot, not this
+service, because the DM is sent with PERBot's bot token. PERBot re-reads the row,
+writes `Unit cost` (and the product link when the option is a different listing)
+only if the row hasn't changed since the alert, notes it in `Notes (internal)`
+and offers Undo. Block/action ids and button values are a contract with PERBot's
+`src/priceCheck/blocks.ts`; change both together.
+
 **Sharing PERBot's tokens:** Notion and Slack let both apps use the same tokens
 at once; their rate limits are shared. A rate-limited call (HTTP 429) waits for
 the `Retry-After` time and tries again, up to 3 times.

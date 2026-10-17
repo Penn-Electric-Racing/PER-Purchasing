@@ -23,9 +23,11 @@ class Slack:
             raise RuntimeError(f"Slack {method}: {data.get('error', r.status_code)}")
         return data
 
-    def post(self, channel, text):
-        # A user id as channel DMs that user (chat:write only, as PERBot's jobs do).
-        self._call("chat.postMessage", channel=channel, text=text, unfurl_links=False)
+    def post(self, channel, text, blocks=None):
+        # A user id as channel DMs that user (chat:write only, as PERBot's jobs do). With
+        # blocks, `text` is the notification / fallback.
+        params = {"blocks": blocks} if blocks else {}
+        self._call("chat.postMessage", channel=channel, text=text, unfurl_links=False, **params)
 
     def lookup_email(self, email):
         try:
