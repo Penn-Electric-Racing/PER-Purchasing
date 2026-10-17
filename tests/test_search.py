@@ -1,17 +1,16 @@
-"""Offline tests for scraper.py's search backends, page fetching and page parsing.
+"""Offline tests for the search backends and page fetching (scrapers/websearch.py) and page
+parsing (scrapers/regex_scraper.py).
 
     pip install requests beautifulsoup4 pytest
     pytest
 """
 import json
-import os
-import sys
 
 import pytest
 import requests
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import scraper as s  # noqa: E402
+from scrapers import regex_scraper as s
+from scrapers import websearch as ws
 
 
 class Resp:
@@ -37,7 +36,7 @@ def calls_to(monkeypatch, method, *responses):
 
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
-    monkeypatch.setattr(s.time, "sleep", lambda t: None)
+    monkeypatch.setattr(ws.time, "sleep", lambda t: None)
 
 
 # ---------------------------------------------------------------- Brave
@@ -50,13 +49,13 @@ def brave_page(n, start=0):
 def test_brave_needs_a_key(monkeypatch):
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     with pytest.raises(s.BackendError, match="BRAVE_API_KEY"):
-        s.brave("LM7805", 10)
+        ws.brave("LM7805", 10)
 
 
 def test_brave_pages_until_enough(monkeypatch):
     monkeypatch.setenv("BRAVE_API_KEY", "k")
     calls = calls_to(monkeypatch, "get", brave_page(20), brave_page(20, 20))
-    out = s.brave("LM7805", 30)
+    out = ws.brave("LM7805", 30)
     assert len(out) == 30 and [c["params"]["offset"] for c in calls] == [0, 1]
     assert out[0] == {"title": "t0", "url": "https://x.com/0", "snippet": "LM7805 0"}  # HTML stripped
     assert calls[0]["headers"]["X-Subscription-Token"] == "k"
@@ -65,16 +64,16 @@ def test_brave_pages_until_enough(monkeypatch):
 def test_brave_stops_on_a_short_page(monkeypatch):
     monkeypatch.setenv("BRAVE_API_KEY", "k")
     calls = calls_to(monkeypatch, "get", brave_page(5))
-    assert len(s.brave("LM7805", 30)) == 5 and len(calls) == 1
+    assert len(ws.brave("LM7805", 30)) == 5 and len(calls) == 1
 
 
 def test_brave_first_page_error_raises_later_error_keeps_results(monkeypatch):
     monkeypatch.setenv("BRAVE_API_KEY", "k")
     calls_to(monkeypatch, "get", Resp(429))
     with pytest.raises(s.BackendError, match="HTTP 429"):
-        s.brave("LM7805", 10)
+        ws.brave("LM7805", 10)
     calls_to(monkeypatch, "get", brave_page(20), Resp(500))
-    assert len(s.brave("LM7805", 30)) == 20
+    assert len(ws.brave("LM7805", 30)) == 20
 
 
 # ---------------------------------------------------------------- Serper
@@ -86,7 +85,7 @@ def serper_page(n):
 def test_serper(monkeypatch):
     monkeypatch.setenv("SERPER_API_KEY", "k")
     calls = calls_to(monkeypatch, "post", serper_page(10), serper_page(10), serper_page(4))
-    out = s.serper("LM7805", 30)
+    out = ws.serper("LM7805", 30)
     assert len(out) == 24 and [c["json"]["page"] for c in calls] == [1, 2, 3]
     assert out[0]["url"] == "https://x.com/0" and calls[0]["headers"]["X-API-KEY"] == "k"
 
@@ -94,13 +93,13 @@ def test_serper(monkeypatch):
 def test_serper_errors(monkeypatch):
     monkeypatch.delenv("SERPER_API_KEY", raising=False)
     with pytest.raises(s.BackendError, match="SERPER_API_KEY"):
-        s.serper("q", 10)
+        ws.serper("q", 10)
     monkeypatch.setenv("SERPER_API_KEY", "k")
     calls_to(monkeypatch, "post", Resp(403))
     with pytest.raises(s.BackendError, match="HTTP 403"):
-        s.serper("q", 10)
+        ws.serper("q", 10)
     calls_to(monkeypatch, "post", serper_page(10), Resp(500))
-    assert len(s.serper("q", 20)) == 10
+    assert len(ws.serper("q", 20)) == 10
 
 
 # ---------------------------------------------------------------- Google CSE
@@ -110,7 +109,7 @@ def test_google_cse(monkeypatch):
     page = Resp(body={"items": [{"title": "t", "link": f"https://x.com/{i}", "snippet": ""}
                                 for i in range(10)]})
     calls = calls_to(monkeypatch, "get", page, Resp(body={"items": []}))
-    assert len(s.google_cse("LM7805", 20)) == 10
+    assert len(ws.google_cse("LM7805", 20)) == 10
     assert [c["params"]["start"] for c in calls] == [1, 11] and calls[0]["params"]["cx"] == "cx"
 
 
@@ -118,11 +117,11 @@ def test_google_cse_errors(monkeypatch):
     monkeypatch.delenv("GOOGLE_CSE_ID", raising=False)
     monkeypatch.setenv("GOOGLE_API_KEY", "k")
     with pytest.raises(s.BackendError, match="GOOGLE_CSE_ID"):
-        s.google_cse("q", 10)
+        ws.google_cse("q", 10)
     monkeypatch.setenv("GOOGLE_CSE_ID", "cx")
     calls_to(monkeypatch, "get", Resp(400))
     with pytest.raises(s.BackendError, match="HTTP 400"):
-        s.google_cse("q", 10)
+        ws.google_cse("q", 10)
 
 
 # ---------------------------------------------------------------- DuckDuckGo
@@ -140,13 +139,13 @@ NEXT_FORM = ('<form><input name="q" value="LM7805"><input name="s" value="30">'
 
 
 def test_clean_ddg_url():
-    assert s._clean_ddg_url("//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com%2Fx") == "https://a.com/x"
-    assert s._clean_ddg_url("https://a.com/x") == "https://a.com/x"
+    assert ws._clean_ddg_url("//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com%2Fx") == "https://a.com/x"
+    assert ws._clean_ddg_url("https://a.com/x") == "https://a.com/x"
 
 
 def test_ddg_page_parses_results_and_next_form(monkeypatch):
     calls_to(monkeypatch, "post", Resp(text=DDG_HTML.format(next=NEXT_FORM)))
-    results, nxt = s._ddg_page({"q": "LM7805"})
+    results, nxt = ws._ddg_page({"q": "LM7805"})
     assert [r["url"] for r in results] == ["https://shop.com/lm7805", "https://b.com/p"]  # ad skipped
     assert results[0]["snippet"] == "LM7805 $0.89"
     assert nxt == {"q": "LM7805", "s": "30", "vqd": "abc"}
@@ -155,7 +154,7 @@ def test_ddg_page_parses_results_and_next_form(monkeypatch):
 def test_ddg_page_retries_challenges_and_errors(monkeypatch):
     calls = calls_to(monkeypatch, "post", Resp(202), Resp(text='<div class="anomaly-modal"></div>'),
                      Resp(text=DDG_HTML.format(next="")))
-    results, nxt = s._ddg_page({"q": "x"})
+    results, nxt = ws._ddg_page({"q": "x"})
     assert len(calls) == 3 and len(results) == 2 and nxt is None
 
 
@@ -164,10 +163,10 @@ def test_ddg_page_gives_up(monkeypatch):
         raise requests.ConnectionError("Connection reset")
     monkeypatch.setattr(s.requests, "post", boom)
     with pytest.raises(s.BackendError, match="Connection reset"):
-        s._ddg_page({"q": "x"})
+        ws._ddg_page({"q": "x"})
     calls_to(monkeypatch, "post", *[Resp(text="<html></html>")] * 3)
     with pytest.raises(s.BackendError, match="no results parsed"):
-        s._ddg_page({"q": "x"})
+        ws._ddg_page({"q": "x"})
 
 
 def test_duckduckgo_follows_next_and_keeps_partial(monkeypatch):
@@ -178,11 +177,11 @@ def test_duckduckgo_follows_next_and_keeps_partial(monkeypatch):
         if isinstance(p, Exception):
             raise p
         return p
-    monkeypatch.setattr(s, "_ddg_page", fake)
-    assert s.duckduckgo("q", 10) == [{"url": "https://a.com"}]
-    monkeypatch.setattr(s, "_ddg_page", lambda form: (_ for _ in ()).throw(s.BackendError("x")))
+    monkeypatch.setattr(ws, "_ddg_page", fake)
+    assert ws.duckduckgo("q", 10) == [{"url": "https://a.com"}]
+    monkeypatch.setattr(ws, "_ddg_page", lambda form: (_ for _ in ()).throw(s.BackendError("x")))
     with pytest.raises(s.BackendError):
-        s.duckduckgo("q", 10)
+        ws.duckduckgo("q", 10)
 
 
 # ---------------------------------------------------------------- search
@@ -198,7 +197,7 @@ def test_search_uses_first_working_backend_and_tops_up(monkeypatch):
             return [{"title": "a", "url": "https://a.com/x#frag", "snippet": ""},
                     {"title": "a2", "url": "https://a.com/x/", "snippet": ""}]  # same page
         return [{"title": "b", "url": "https://b.com", "snippet": ""}]
-    monkeypatch.setattr(s, "BACKENDS", [("broken", broken), ("good", good)])
+    monkeypatch.setattr(ws, "BACKENDS", [("broken", broken), ("good", good)])
     name, res = s.search("LM7805 price", 5, variants=("buy LM7805",))
     assert name == "good" and seen == ["LM7805 price", "buy LM7805"]
     assert [r["url"] for r in res] == ["https://a.com/x#frag", "https://b.com"]
@@ -210,12 +209,12 @@ def test_search_variant_failure_is_tolerated(monkeypatch):
         if q != "q":
             raise s.BackendError("rate limited")
         return [{"title": "a", "url": "https://a.com", "snippet": ""}]
-    monkeypatch.setattr(s, "BACKENDS", [("x", backend)])
+    monkeypatch.setattr(ws, "BACKENDS", [("x", backend)])
     assert len(s.search("q", 5, variants=("buy q",))[1]) == 1
 
 
 def test_search_all_failed(monkeypatch, capsys):
-    monkeypatch.setattr(s, "BACKENDS", [("empty", lambda q, n: []),
+    monkeypatch.setattr(ws, "BACKENDS", [("empty", lambda q, n: []),
                                         ("down", lambda q, n: (_ for _ in ()).throw(
                                             requests.Timeout("timed out")))])
     with pytest.raises(RuntimeError, match="All backends failed") as e:
@@ -250,7 +249,7 @@ def test_fetch_html_errors_and_limits(monkeypatch):
     monkeypatch.setattr(s.requests, "get", lambda *a, **k: Stream(status=403))
     with pytest.raises(s.BackendError, match="HTTP 403"):
         s._fetch_html("https://x.com")
-    monkeypatch.setattr(s, "MAX_PAGE_BYTES", 100_000)
+    monkeypatch.setattr(ws, "MAX_PAGE_BYTES", 100_000)
     monkeypatch.setattr(s.requests, "get", lambda *a, **k: Stream(body=b"a" * 500_000))
     assert len(s._fetch_html("https://x.com")) == 128 * 1024  # stops after the chunk past the cap
     monkeypatch.setattr(s.requests, "get", lambda *a, **k: Stream(body="é".encode(), encoding="bogus"))
