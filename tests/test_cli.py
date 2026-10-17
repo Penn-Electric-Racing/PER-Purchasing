@@ -272,7 +272,10 @@ def test_price_check_sweep_alerts(monkeypatch, notion_env, capsys):
     assert notion.limits == [5]
     assert notion_env == [("LM7805", 10, ["https://a.com/lm7805"])]
     assert FakeSlackAPI.posts[0][0] == "S1" and "+100%" in FakeSlackAPI.posts[0][1]
-    assert len(notion.created) == 1  # the Job Log claim
+    claims = [p for p in notion.created if "Run key" in p]
+    ledger = [p for p in notion.created if "Run key" not in p]
+    assert len(claims) == 1  # the Job Log claim
+    assert [p["Outcome"]["select"]["name"] for p in ledger] == ["Pending"]  # the savings ledger row
     assert "Price check: 1 alerted" in capsys.readouterr().err
 
 
@@ -288,7 +291,9 @@ def test_price_check_queue_drains_entries(monkeypatch, notion_env, capsys):
     run(check, monkeypatch, "--queue")
     notion = FakeNotionAPI.instances[0]
     assert notion.limits == [None, 4] and notion.done == ["e1"]  # discovery, then the queue
-    assert len(notion.created) == 2  # row1 discovered + queued, then its alert claim
+    # row1 discovered + queued, then its alert claim, then its savings-ledger row
+    assert len([p for p in notion.created if "Run key" in p]) == 2
+    assert len([p for p in notion.created if "Run key" not in p]) == 1
     err = capsys.readouterr().err
     assert FakeSlackAPI.posts and "1 new row(s) queued" in err and "Price check: 1 alerted" in err
 

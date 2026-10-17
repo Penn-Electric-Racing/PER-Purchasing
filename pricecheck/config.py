@@ -6,6 +6,8 @@ from dataclasses import dataclass
 # PERBot's defaults (PERBot/src/config.ts), so both apps point at the same databases.
 DEFAULT_PURCHASING_DS = "39e560bc-c039-83db-9f16-076cb18f7d7b"
 DEFAULT_JOB_LOG_DS = "db0c6a0d-e10b-4edf-97fb-6f381d15a465"
+# 💸 Price Check Savings (under Purchasing — PEFS); PERBot reads and updates it too.
+DEFAULT_LEDGER_DS = "dd1818e3-82cd-461b-8071-12af3b0f1341"
 
 
 @dataclass
@@ -22,6 +24,7 @@ class Config:
     pool: int = 15
     batch: int = 10
     lookback_hours: float = 168
+    ledger_ds: str = DEFAULT_LEDGER_DS
 
     @classmethod
     def from_env(cls, need_slack=True):
@@ -54,4 +57,6 @@ class Config:
             pool=int(number("PRICE_CHECK_POOL", 15)),
             batch=max(1, int(number("PRICE_CHECK_BATCH", 10))),
             lookback_hours=number("PRICE_CHECK_LOOKBACK_HOURS", 168),
+            # Set but empty turns the savings ledger off.
+            ledger_ds=os.getenv("PRICE_CHECK_LEDGER_DS_ID", DEFAULT_LEDGER_DS).strip(),
         )

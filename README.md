@@ -95,6 +95,13 @@ Use asks for a confirmation (check the listing first: right part, in stock, this
 price), so a person looks at the listing before Notion changes. Block/action ids and button values are a contract with PERBot's
 `src/priceCheck/blocks.ts`; change both together.
 
+**Savings ledger:** each alert that's sent is also logged as a Pending row in
+💸 Price Check Savings (Notion, under Purchasing — PEFS), with the old price, the
+price offered and `Potential $ = (old − offered) × Quant.`. PERBot fills in the
+outcome when someone clicks (Used / Kept / Undone), sets `Saved $`, and marks a
+row Realized once it's ordered at the new price. `/pricecheck` in Slack sums it
+up (this season, `week`, or `all`). A failed ledger write never stops an alert.
+
 **Sharing PERBot's tokens:** Notion and Slack let both apps use the same tokens
 at once; their rate limits are shared. A rate-limited call (HTTP 429) waits for
 the `Retry-After` time and tries again, up to 3 times.
@@ -156,6 +163,7 @@ match PERBot's, so the same values work in both.
 | `PRICE_LISTENER_SETTLE_SECONDS` | `60` | Wait this long after a row's last edit |
 | `PRICE_LISTENER_MAX_PER_HOUR` | `20` | Rows checked per hour at most |
 | `PRICE_CHECK_LOOKBACK_HOURS` | `168` | On startup, catch up on rows created this recently |
+| `PRICE_CHECK_LEDGER_DS_ID` | PERBot's | 💸 Price Check Savings data source; empty turns the ledger off |
 | `PRICE_CHECK_POOL` | `15` | Search results read per row |
 | `BENBUYS_SEASON` | `REV12` | Only this season's rows are checked |
 | `BENBUYS_PURCHASING_DS_ID`, `NOTION_JOB_LOG_DS_ID`, `NOTION_API_VERSION` | PERBot's | Which databases to use |
