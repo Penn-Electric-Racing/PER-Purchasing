@@ -90,7 +90,9 @@ option, unless it's flagged) and **Keep $Y**. Clicks go to PERBot, not this
 service, because the DM is sent with PERBot's bot token. PERBot re-reads the row,
 writes `Unit cost` (and the product link when the option is a different listing)
 only if the row hasn't changed since the alert, notes it in `Notes (internal)`
-and offers Undo. Block/action ids and button values are a contract with PERBot's
+and offers Undo. Each option also gets a **View <supplier> ↗** link button, and
+Use asks for a confirmation (check the listing first: right part, in stock, this
+price), so a person looks at the listing before Notion changes. Block/action ids and button values are a contract with PERBot's
 `src/priceCheck/blocks.ts`; change both together.
 
 **Sharing PERBot's tokens:** Notion and Slack let both apps use the same tokens
@@ -108,7 +110,7 @@ It runs on Render as a web service (`render.yaml`), next to PERBot.
 
 1. **Push** this repo to GitHub (`main`).
 2. **Create the service:** Render → **New → Blueprint** → connect
-   `pandabear189/PER-Purchase-Testing`. Render reads `render.yaml` and sets up
+   `Penn-Electric-Racing/PER-Purchasing`. Render reads `render.yaml` and sets up
    `per-price-listener` on the starter plan (about $7/month; a free instance
    sleeps after 15 minutes idle, which pauses the checks).
 3. **Fill in the keys it asks for:** `NOTION_TOKEN` and `SLACK_BOT_TOKEN`

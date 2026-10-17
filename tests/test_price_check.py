@@ -682,7 +682,8 @@ def test_oversized_or_non_http_link_drops_that_button():
     row = pc.parse_row(page(cost=1.00))
     f = pc.compare(row, scored(listing("https://shop.com/" + "x" * 2100, 1.50)), CFG)
     assert pc.alert_buttons(f) is None
-    assert len(pc.alert_blocks(f)) == 1   # alert still sent, just without buttons
+    # Alert still sent, without Use / Keep (the listing can still be opened).
+    assert [b.get("block_id") for b in pc.alert_blocks(f)[1:]] == ["price_swap_links"]
     row = pc.parse_row(page(cost=1.00, link="digikey part 123"))
     f = pc.compare(row, scored(listing("https://shop.com/p", 1.50)), CFG)
     assert pc.alert_buttons(f) is None
@@ -691,14 +692,15 @@ def test_oversized_or_non_http_link_drops_that_button():
 def test_alert_dm_carries_the_buttons(capsys):
     slack = FakeSlack()
     checker(slack=slack).check(pc.parse_row(page()))
-    section, actions = slack.blocks[0]
+    section, links, actions = slack.blocks[0]
     assert section["text"]["text"] == slack.posts[0][1]
-    assert actions["block_id"] == "price_swap_actions"
+    assert links["block_id"] == "price_swap_links" and actions["block_id"] == "price_swap_actions"
 
 
 def test_dry_run_prints_the_buttons(capsys):
     checker(dry_run=True).check(pc.parse_row(page()))
-    assert "[Use $2.00/unit · www.digikey.com | Keep $1.00/unit]" in capsys.readouterr().out
+    assert ("[View www.digikey.com (your link) ↗ | Use $2.00/unit · www.digikey.com | "
+            "Keep $1.00/unit]") in capsys.readouterr().out
 
 
 def test_slack_post_with_blocks(monkeypatch):
@@ -706,3 +708,32 @@ def test_slack_post_with_blocks(monkeypatch):
     pc.Slack("xoxb").post("U1", "hi", [{"type": "divider"}])
     assert calls[0][1] == {"channel": "U1", "text": "hi", "unfurl_links": False,
                            "blocks": [{"type": "divider"}]}
+
+
+def test_view_links_for_every_option_even_flagged():
+    row = pc.parse_row(page(cost=1.00))
+    f = pc.compare(row, scored(listing(row.link, 1.30), listing("https://shop.com/p", 0.80)), CFG)
+    f.cheaper["notes"] = ["search page: lowest listing"]
+    links = pc.alert_links(f)
+    assert links["block_id"] == "price_swap_links"
+    assert [(b["action_id"], b["url"], b["text"]["text"]) for b in links["elements"]] == [
+        ("price_swap_view:0", "https://www.digikey.com/x", "View www.digikey.com (your link) ↗"),
+        ("price_swap_view:1", "https://shop.com/p", "View shop.com ↗")]
+    assert all("value" not in b for b in links["elements"])
+    # Links sit above Use / Keep, so they stay when PERBot swaps the buttons for the outcome.
+    assert [b.get("block_id") for b in pc.alert_blocks(f)] == [None, "price_swap_links", "price_swap_actions"]
+
+
+def test_use_asks_for_a_check_first():
+    row = pc.parse_row(page(cost=1.00))
+    f = pc.compare(row, scored(listing(row.link, 1.30), listing("https://shop.com/p", 0.80)), CFG)
+    found, cheaper, keep = pc.alert_buttons(f)["elements"]
+    assert found["confirm"]["text"]["text"] == (
+        "Set Unit cost to $1.30 (www.digikey.com)? Open the listing first and check it's the "
+        "right part, in stock, at this price.")
+    assert "switch the product link to it" in cheaper["confirm"]["text"]["text"]
+    assert found["confirm"]["confirm"]["text"] == "Update Unit cost" and "confirm" not in keep
+    for b in (found, cheaper):
+        c = b["confirm"]
+        assert len(c["title"]["text"]) <= 100 and len(c["text"]["text"]) <= 300
+        assert len(c["confirm"]["text"]) <= 30 and len(c["deny"]["text"]) <= 30

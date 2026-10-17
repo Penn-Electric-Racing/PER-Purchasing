@@ -3,7 +3,8 @@
 Slack sends the button clicks to PERBot, not this service, because the DM is posted with
 PERBot's bot token; PERBot re-reads the row and writes Unit cost (and the product link when
 the option is a different listing). The block ids, action ids and button values are a
-contract with PERBot's src/priceCheck/blocks.ts: change both together.
+contract with PERBot's src/priceCheck/blocks.ts: change both together. PERBot also acks
+the View-listing link buttons (action ids price_swap_view:<i>), which Slack reports too.
 """
 import json
 import re
@@ -61,6 +62,7 @@ def format_alert(f):
 
 # Button contract with PERBot (src/priceCheck/blocks.ts), which handles the clicks.
 ACTIONS_BLOCK_ID = "price_swap_actions"
+LINKS_BLOCK_ID = "price_swap_links"     # View-listing buttons; stay after a click
 BUTTON_VALUE_MAX = 2000   # Slack's cap on a button value
 BUTTON_TEXT_MAX = 75      # Slack's cap on a button label
 _HTTP_URL_RE = re.compile(r"^https?://\S+$", re.I)
@@ -96,8 +98,32 @@ def _use_button(i, f, listing):
     if value is None:
         return None
     label = f"Use ${money(listing['unit_cost'])}/unit · {supplier}"
+    switch = " and switch the product link to it" if "l" in v else ""
+    check = (f"Set Unit cost to ${money(n)} ({supplier}){switch}? Open the listing first and "
+             "check it's the right part, in stock, at this price.")
     return {"type": "button", "action_id": f"price_swap_use:{i}", "value": value,
-            "text": {"type": "plain_text", "text": label[:BUTTON_TEXT_MAX]}}
+            "text": {"type": "plain_text", "text": label[:BUTTON_TEXT_MAX]},
+            # The human check: Slack asks before PERBot writes anything.
+            "confirm": {"title": {"type": "plain_text", "text": "Update Notion?"},
+                        "text": {"type": "plain_text", "text": check[:300]},
+                        "confirm": {"type": "plain_text", "text": "Update Unit cost"},
+                        "deny": {"type": "plain_text", "text": "Not yet"}}}
+
+
+def alert_links(f):
+    """Link buttons that open each option's listing (flagged ones too: looking is harmless),
+    so whoever clicks Use has checked the page. None when no listing has an http link."""
+    options = [f.found] + ([f.cheaper] if f.cheaper else [])
+    links = []
+    for i, o in enumerate(options):
+        url = o.get("url") or ""
+        if not _HTTP_URL_RE.match(url) or len(url) > 3000:
+            continue
+        mine = bool(f.row.link and _same_url(url, f.row.link))
+        label = f"View {o.get('supplier') or 'listing'}{' (your link)' if mine else ''} ↗"
+        links.append({"type": "button", "action_id": f"price_swap_view:{i}", "url": url,
+                      "text": {"type": "plain_text", "text": label[:BUTTON_TEXT_MAX]}})
+    return {"type": "actions", "block_id": LINKS_BLOCK_ID, "elements": links} if links else None
 
 
 def alert_buttons(f):
@@ -117,7 +143,6 @@ def alert_buttons(f):
 
 
 def alert_blocks(f, text=None):
-    """Block Kit for the DM: the alert text, then its buttons when there are any."""
+    """Block Kit for the DM: the alert text, View-listing links, then Use / Keep."""
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text or format_alert(f)}}]
-    buttons = alert_buttons(f)
-    return blocks + [buttons] if buttons else blocks
+    return blocks + [b for b in (alert_links(f), alert_buttons(f)) if b]

@@ -26,7 +26,7 @@ _EXPORTS = {
     "Checker": "check", "make_find": "check", "Config": "config",
     # comparing and alerting
     "Finding": "comparison", "compare": "comparison", "format_alert": "alert", "money": "alert",
-    "alert_buttons": "alert", "alert_blocks": "alert",
+    "alert_buttons": "alert", "alert_blocks": "alert", "alert_links": "alert",
     # Notion
     "Notion": "notion", "Row": "notion", "parse_row": "notion", "skip_reason": "notion",
     "open_rows": "notion",
