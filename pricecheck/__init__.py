@@ -5,7 +5,7 @@ on Slack when the price moved.
     listener.py    the app: Notion webhooks -> settle -> queue -> one worker checks rows
     check.py       Checker (check one row, drain the queue) and the manual CLI
     comparison.py  the row's Unit cost vs. the prices found (Finding)
-    alert.py       the Slack text of an alert
+    alert.py       the Slack message of an alert (text + Use / Keep buttons)
     notion.py      Notion client, Purchasing columns and rows
     joblog.py      PERBot's Job Log: the queue and alert dedup
     slack.py       Slack client and Notion person -> Slack user matching
@@ -26,6 +26,7 @@ _EXPORTS = {
     "Checker": "check", "make_find": "check", "Config": "config",
     # comparing and alerting
     "Finding": "comparison", "compare": "comparison", "format_alert": "alert", "money": "alert",
+    "alert_buttons": "alert", "alert_blocks": "alert",
     # Notion
     "Notion": "notion", "Row": "notion", "parse_row": "notion", "skip_reason": "notion",
     "open_rows": "notion",

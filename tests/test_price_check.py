@@ -3,6 +3,7 @@
     pip install requests beautifulsoup4 pytest
     pytest
 """
+import json
 import sys
 import time
 from datetime import datetime, timezone
@@ -89,7 +90,7 @@ class FakeNotion:
 
 class FakeSlack:
     def __init__(self, members=(("S1", ["Ada Lovelace"], "ada@upenn.edu"),)):
-        self.members, self.posts = list(members), []
+        self.members, self.posts, self.blocks = list(members), [], []
 
     def directory(self):
         return self.members
@@ -97,8 +98,9 @@ class FakeSlack:
     def lookup_email(self, email):
         return None
 
-    def post(self, channel, text):
+    def post(self, channel, text, blocks=None):
         self.posts.append((channel, text))
+        self.blocks.append(blocks)
 
 
 # ---------------------------------------------------------------- rows
@@ -521,7 +523,7 @@ def test_slack_directory_paginates_and_skips_bots(monkeypatch):
 
 def test_slack_post_failure_does_not_stop_the_run(capsys):
     class Down(FakeSlack):
-        def post(self, channel, text):
+        def post(self, channel, text, blocks=None):
             raise RuntimeError("Slack chat.postMessage: not_in_channel")
     checker(slack=Down()).check(pc.parse_row(page()))
     assert "Slack post to S1 failed" in capsys.readouterr().err
@@ -614,3 +616,93 @@ def test_rate_limit_gives_up_after_retries(monkeypatch, slept):
     with pytest.raises(RuntimeError, match="HTTP 429"):
         pc.Notion("t", "v").page("p")
     assert len(calls) == RATE_LIMIT_RETRIES + 1 and slept == [1, 2, 4]
+
+
+# ---------------------------------------------------------------- buttons (PERBot handles clicks)
+def _values(block):
+    return [(b["action_id"], json.loads(b["value"])) for b in block["elements"]]
+
+
+def test_buttons_use_found_price_at_own_link_and_keep():
+    row = pc.parse_row(page(cost=1.00))
+    f = pc.compare(row, scored(listing(row.link, 0.80)), CFG)
+    block = pc.alert_buttons(f)
+    assert block["block_id"] == "price_swap_actions"
+    (use_id, use), (keep_id, keep) = _values(block)
+    assert use_id == "price_swap_use:0" and keep_id == "price_swap_keep"
+    # Same listing as the row's link: price only, no link switch.
+    assert use == {"v": 1, "r": "p1", "q": 50, "o": 1.0, "n": 0.8, "s": "www.digikey.com"}
+    assert keep == {"v": 1, "r": "p1", "q": 50, "o": 1.0}
+    labels = [b["text"]["text"] for b in block["elements"]]
+    assert labels == ["Use $0.80/unit · www.digikey.com", "Keep $1.00/unit"]
+    assert block["elements"][0]["style"] == "primary"
+
+
+def test_cheaper_option_button_switches_the_link():
+    row = pc.parse_row(page(cost=1.00))
+    f = pc.compare(row, scored(listing(row.link, 1.30), listing("https://shop.com/p", 0.80)), CFG)
+    (a, found), (b, cheaper), (_, _) = _values(pc.alert_buttons(f))
+    assert (a, b) == ("price_swap_use:0", "price_swap_use:1")
+    assert found["n"] == 1.3 and "l" not in found
+    assert cheaper["n"] == 0.8 and cheaper["l"] == "https://shop.com/p"
+    assert cheaper["ol"] == "https://www.digikey.com/x"
+    els = pc.alert_buttons(f)["elements"]
+    assert "style" not in els[0] and els[1]["style"] == "primary"
+
+
+def test_flagged_cheaper_option_gets_no_button():
+    row = pc.parse_row(page(cost=1.00))
+    f = pc.compare(row, scored(listing(row.link, 1.30), listing("https://shop.com/p", 0.80)), CFG)
+    f.cheaper["notes"] = ["search page: lowest listing"]
+    assert [i for i, _ in _values(pc.alert_buttons(f))] == ["price_swap_use:0", "price_swap_keep"]
+
+
+def test_best_option_elsewhere_switches_link_even_from_empty():
+    row = pc.parse_row(page(cost=1.00, link=None))
+    f = pc.compare(row, scored(listing("https://shop.com/p", 1.50)), CFG)
+    use = _values(pc.alert_buttons(f))[0][1]
+    assert use["l"] == "https://shop.com/p" and use["ol"] == ""
+
+
+def test_pack_row_buttons_carry_per_pack_prices():
+    row = pc.parse_row(page(qty=5, cost=10.00, notes="Sold in packs of 10"))
+    f = pc.compare(row, scored(listing(row.link, 0.80, qty=50)), CFG)
+    (_, use), (_, keep) = _values(pc.alert_buttons(f))
+    assert use["n"] == 8.0 and use["o"] == 10.0 and use["q"] == 5 and keep["o"] == 10.0
+    assert pc.alert_buttons(f)["elements"][1]["text"]["text"] == "Keep $1.00/unit"
+
+
+def test_sub_dollar_prices_round_like_money():
+    row = pc.parse_row(page(cost=0.10))
+    f = pc.compare(row, scored(listing(row.link, 0.0425123)), CFG)
+    assert _values(pc.alert_buttons(f))[0][1]["n"] == 0.0425
+
+
+def test_oversized_or_non_http_link_drops_that_button():
+    row = pc.parse_row(page(cost=1.00))
+    f = pc.compare(row, scored(listing("https://shop.com/" + "x" * 2100, 1.50)), CFG)
+    assert pc.alert_buttons(f) is None
+    assert len(pc.alert_blocks(f)) == 1   # alert still sent, just without buttons
+    row = pc.parse_row(page(cost=1.00, link="digikey part 123"))
+    f = pc.compare(row, scored(listing("https://shop.com/p", 1.50)), CFG)
+    assert pc.alert_buttons(f) is None
+
+
+def test_alert_dm_carries_the_buttons(capsys):
+    slack = FakeSlack()
+    checker(slack=slack).check(pc.parse_row(page()))
+    section, actions = slack.blocks[0]
+    assert section["text"]["text"] == slack.posts[0][1]
+    assert actions["block_id"] == "price_swap_actions"
+
+
+def test_dry_run_prints_the_buttons(capsys):
+    checker(dry_run=True).check(pc.parse_row(page()))
+    assert "[Use $2.00/unit · www.digikey.com | Keep $1.00/unit]" in capsys.readouterr().out
+
+
+def test_slack_post_with_blocks(monkeypatch):
+    calls = slack_http(monkeypatch, {"ok": True})
+    pc.Slack("xoxb").post("U1", "hi", [{"type": "divider"}])
+    assert calls[0][1] == {"channel": "U1", "text": "hi", "unfurl_links": False,
+                           "blocks": [{"type": "divider"}]}
