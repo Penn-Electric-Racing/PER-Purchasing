@@ -19,6 +19,7 @@ Run from the project root:
     python -m pricecheck.check --row <url>   # check one row now
 """
 from importlib import import_module
+from typing import Any
 
 # Public names -> the module that defines them, imported on first use (PEP 562) so
 # `python -m pricecheck.check` doesn't import its own module twice.
@@ -42,11 +43,11 @@ _EXPORTS = {
 __all__ = list(_EXPORTS)
 
 
-def __getattr__(name):
+def __getattr__(name: str) -> Any:
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     return getattr(import_module(f".{_EXPORTS[name]}", __name__), name)
 
 
-def __dir__():
+def __dir__() -> list[str]:
     return sorted([*globals(), *__all__])

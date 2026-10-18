@@ -20,9 +20,12 @@ import os
 import re
 import sys
 import time
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import requests
+
+from .listing import Listing, PriceBreaks
 
 TIMEOUT = 15
 MAX_RECORDS = 50  # both APIs return at most 50 parts per call
@@ -39,13 +42,13 @@ class APIError(Exception):
     """A distributor API is not configured, or a request failed."""
 
 
-def _blank():
+def _blank() -> Listing:
     # Imported here: regex_scraper imports this module, so a top-level import would be circular.
     from .regex_scraper import _blank_info
     return _blank_info()
 
 
-def _env_float(name):
+def _env_float(name: str) -> float | None:
     """Float from an environment variable, or None if unset/invalid."""
     try:
         return float(os.environ[name])
@@ -53,7 +56,7 @@ def _env_float(name):
         return None
 
 
-def _price(s):
+def _price(s: object) -> float | None:
     """Mouser price strings: "$0.89", "1,234.50 USD", "0,89 €" -> float, else None."""
     s = re.sub(r"[^\d.,]", "", str(s or ""))
     if "," in s and "." not in s and re.search(r",\d{1,4}$", s) and not re.search(r",\d{3}$", s):
@@ -64,34 +67,34 @@ def _price(s):
         return None
 
 
-def _int(v):
+def _int(v: object) -> int | None:
     """"12,400" / 12400 / "12400 In Stock" -> 12400, else None."""
     m = re.search(r"\d[\d,]*", str(v if v is not None else ""))
     return int(m.group().replace(",", "")) if m else None
 
 
-def order_units(qty, min_order=None, mult=None):
+def order_units(qty: int, min_order: int | None = None, mult: int | None = None) -> int:
     """Units you actually have to buy: at least the minimum, in whole multiples."""
     units = max(qty, min_order or 1)
     mult = mult or 1
     return -(-units // mult) * mult
 
 
-def _ship_time(stock, lead):
+def _ship_time(stock: int | None, lead: str | None) -> str | None:
     """In stock: ships today. Otherwise the factory lead time ("16 weeks"), if known."""
     if stock:
         return "ships same day"
     return lead or None
 
 
-def _candidate(title, url, snippet, supplier, **info):
+def _candidate(title: str, url: str, snippet: str, supplier: str, **info: Any) -> Listing:
     """A result dict in the same shape regex_scraper.part_info produces."""
     return {"title": title, "url": url, "snippet": snippet,
             **_blank(), "supplier": supplier, "cost_source": "api", **info}
 
 
 # ---------------------------------------------------------------- Mouser
-def mouser(query, qty=1, n=10):
+def mouser(query: str, qty: int = 1, n: int = 10) -> list[Listing]:
     """Up to `n` priced parts from Mouser's keyword search (needs MOUSER_API_KEY)."""
     key = os.getenv("MOUSER_API_KEY")
     if not key:
@@ -136,10 +139,10 @@ def mouser(query, qty=1, n=10):
 
 
 # ---------------------------------------------------------------- DigiKey
-_token = {"value": None, "expires": 0.0}
+_token: dict[str, Any] = {"value": None, "expires": 0.0}
 
 
-def _digikey_token(client_id, secret):
+def _digikey_token(client_id: str, secret: str) -> str:
     """OAuth2 client-credentials token, cached until shortly before it expires."""
     if _token["value"] and time.time() < _token["expires"]:
         return _token["value"]
@@ -152,10 +155,14 @@ def _digikey_token(client_id, secret):
     return _token["value"]
 
 
-def _best_variation(variations, qty):
+# (order cost, variation, package name, price breaks, minimum order, order multiple)
+Variation = tuple[float, dict[str, Any], str, PriceBreaks, int, int | None]
+
+
+def _best_variation(variations: list[dict[str, Any]] | None, qty: int) -> Variation | None:
     """The packaging (cut tape, reel, tube...) that's cheapest for `qty` units.
     Digi-Reel is skipped: its price excludes the reeling fee."""
-    best = None
+    best: Variation | None = None
     for v in variations or []:
         pkg = ((v.get("PackageType") or {}).get("Name") or "")
         if "digi-reel" in pkg.lower():
@@ -175,7 +182,7 @@ def _best_variation(variations, qty):
     return best
 
 
-def digikey(query, qty=1, n=10):
+def digikey(query: str, qty: int = 1, n: int = 10) -> list[Listing]:
     """Up to `n` priced parts from DigiKey's v4 keyword search
     (needs DIGIKEY_CLIENT_ID and DIGIKEY_CLIENT_SECRET)."""
     cid, secret = os.getenv("DIGIKEY_CLIENT_ID"), os.getenv("DIGIKEY_CLIENT_SECRET")
@@ -227,11 +234,13 @@ def digikey(query, qty=1, n=10):
     return out
 
 
-APIS = [("mouser", mouser), ("digikey", digikey)]
+APIS: list[tuple[str, Callable[[str, int, int], list[Listing]]]] = [
+    ("mouser", mouser), ("digikey", digikey)]
 
 
 # ---------------------------------------------------------------- merging
-def lookup(query, qty=1, n=10, verbose=False):
+def lookup(query: str, qty: int = 1, n: int = 10,
+           verbose: bool = False) -> tuple[list[Listing], list[str]]:
     """Results from every configured API: (results, names of APIs that returned some).
     Unconfigured or failing APIs are skipped (logged with `verbose`)."""
     out, used = [], []
@@ -250,10 +259,10 @@ def lookup(query, qty=1, n=10, verbose=False):
     return out, used
 
 
-def drop_api_sites(web, used):
+def drop_api_sites(web: list[Listing], used: list[str]) -> list[Listing]:
     """Web results minus pages from a site whose API answered: the API's data for the
     same parts is exact, so those pages needn't be fetched."""
-    def from_api_site(r):
+    def from_api_site(r: Listing) -> bool:
         host = urlparse(r["url"]).netloc.lower()
         return any(SITE_RES[name].search(host) for name in used)
     return [r for r in web if not from_api_site(r)]

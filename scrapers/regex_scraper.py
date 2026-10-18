@@ -40,13 +40,16 @@ import json
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Container, Iterator
+from typing import Any
 from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from . import distributors
 from .env import load_env
+from .listing import Listing
 from .ranking import Scorer, Weights, _alnum
 from .websearch import BackendError, _fetch_html, _search_help, search
 
@@ -110,7 +113,7 @@ STOCK_RES = [
 OUT_OF_STOCK_RE = re.compile(r"\b(?:out\sof\sstock|sold\sout|currently\sunavailable|backorder(?:ed)?)\b", re.I)
 
 
-def _to_float(s):
+def _to_float(s: object) -> float | None:
     """"1,234.50" / 12 / None -> float, or None if it isn't a number."""
     try:
         return float(str(s).replace(",", ""))
@@ -123,7 +126,8 @@ RELATED_LD_KEYS = {"isRelatedTo", "isSimilarTo", "isAccessoryOrSparePartFor",
                    "isConsumableFor", "itemListElement", "review", "isVariantOf"}
 
 
-def _iter_ld(node, skip=frozenset(), product=None):
+def _iter_ld(node: Any, skip: Container[str] = frozenset(),
+             product: str | None = None) -> Iterator[tuple[dict[str, Any], str | None]]:
     """Yield (dict, owning product name) for every dict inside a JSON-LD blob
     (handles @graph, lists, nesting); keys in `skip` aren't descended into."""
     if isinstance(node, dict):
@@ -138,20 +142,20 @@ def _iter_ld(node, skip=frozenset(), product=None):
             yield from _iter_ld(v, skip, product)
 
 
-def _same_url(a, b):
+def _same_url(a: str | None, b: str | None) -> bool:
     """True if two URLs point at the same page (ignores www., trailing / and fragment)."""
-    a, b = urlparse(a or ""), urlparse(b or "")
-    return bool(a.netloc) and (a.netloc.removeprefix("www."), a.path.rstrip("/"), a.query) == \
-        (b.netloc.removeprefix("www."), b.path.rstrip("/"), b.query)
+    pa, pb = urlparse(a or ""), urlparse(b or "")
+    return bool(pa.netloc) and (pa.netloc.removeprefix("www."), pa.path.rstrip("/"), pa.query) == \
+        (pb.netloc.removeprefix("www."), pb.path.rstrip("/"), pb.query)
 
 
-def _types(d):
+def _types(d: dict[str, Any]) -> set[str]:
     """A JSON-LD node's @type as a set (it may be a string or a list)."""
     t = d.get("@type", [])
     return {t} if isinstance(t, str) else set(t or [])
 
 
-def _fmt_span(lo, hi, unit="days"):
+def _fmt_span(lo: int | None, hi: int | None, unit: str = "days") -> str | None:
     """(2, 5) -> "2-5 days", (None, 3) -> "3 days", (2, None) -> "2+ days"."""
     if lo is None and hi is None:
         return None
@@ -160,7 +164,7 @@ def _fmt_span(lo, hi, unit="days"):
     return f"{lo}-{hi} {unit}" if hi is not None else f"{lo}+ {unit}"
 
 
-def _ld_breaks(offer, info):
+def _ld_breaks(offer: dict[str, Any], info: Listing) -> None:
     """Collect quantity price breaks: Offer.eligibleQuantity or priceSpecification entries."""
     specs = offer.get("priceSpecification") or []
     specs = specs if isinstance(specs, list) else [specs]
@@ -173,17 +177,19 @@ def _ld_breaks(offer, info):
                 info["price_breaks"].append((int(min_q), price))
 
 
-def _min_qty(offer):
+def _min_qty(offer: dict[str, Any]) -> float:
     """Minimum order quantity of a JSON-LD offer (eligibleQuantity), default 1."""
     eq = offer.get("eligibleQuantity")
     return (_to_float(eq.get("minValue") or eq.get("value")) or 1) if isinstance(eq, dict) else 1
 
 
-def _from_json_ld(soup, info, page_url="", title="", listing=False):
+def _from_json_ld(soup: BeautifulSoup, info: Listing, page_url: str = "", title: str = "",
+                  listing: bool = False) -> None:
     """Price + details from schema.org JSON-LD. On a product page, only offers of the
     product in the page title count (not related-item carousels), and quantity-break
     offers (min qty > 1) are kept as price breaks rather than the base price."""
-    offers = []  # (price, currency, offer url, product name, min qty)
+    # (price, currency, offer url, product name, min qty)
+    offers: list[tuple[float, str | None, str | None, str | None, float]] = []
     skip = frozenset() if listing else RELATED_LD_KEYS
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
@@ -257,16 +263,17 @@ def _from_json_ld(soup, info, page_url="", title="", listing=False):
         info["price_count"] = len(prices)
 
 
-def _from_meta(soup, info):
+def _from_meta(soup: BeautifulSoup, info: Listing) -> None:
     """Fill price/currency from <meta> or itemprop=price tags, and the supplier from
     og:site_name, when JSON-LD didn't provide them.
     """
-    def meta(*names):
+    def meta(*names: str) -> str | None:
         """Content of the first <meta property|name=...> found among `names`."""
         for n in names:
             m = soup.find("meta", attrs={"property": n}) or soup.find("meta", attrs={"name": n})
-            if m and m.get("content"):
-                return m["content"].strip()
+            content = m.get("content") if isinstance(m, Tag) else None
+            if content:
+                return str(content).strip()
         return None
 
     if info["cost"] is None:
@@ -284,14 +291,15 @@ def _from_meta(soup, info):
             cur = meta("product:price:currency", "og:price:currency")
             if not cur:
                 el = soup.select_one("[itemprop=priceCurrency]")
-                cur = el and (el.get("content") or el.get_text(strip=True))
+                if el:
+                    cur = str(el.get("content") or el.get_text(strip=True))
             info["currency"] = cur or info["currency"]
             info["cost_source"] = "meta"
     if not info["supplier"]:
         info["supplier"] = meta("og:site_name", "application-name")
 
 
-def _text_prices(text):
+def _text_prices(text: str) -> list[tuple[float, str]]:
     """All plausible selling prices in text, in page order, as (value, symbol)."""
     out = []
     for m in MONEY_RE.finditer(text):
@@ -304,7 +312,7 @@ def _text_prices(text):
     return out
 
 
-def _ship_threshold(s):
+def _ship_threshold(s: str) -> float | None:
     """Order minimum in a free-shipping phrase ("on orders over $100"), else None."""
     for rx in FREE_SHIP_MIN_RES:
         m = rx.search(s)
@@ -313,7 +321,7 @@ def _ship_threshold(s):
     return None
 
 
-def _from_text(text, info, source, listing=False):
+def _from_text(text: str, info: Listing, source: str, listing: bool = False) -> None:
     """Regex fallback over plain text: fills price, shipping cost / free-shipping
     minimum, shipping time, stock and in/out of stock, only where `info` is still empty.
     `source` labels where a found price came from; `listing` takes the lowest price.
@@ -352,15 +360,15 @@ def _from_text(text, info, source, listing=False):
                 break
     if info["shipping_time"] is None:
         for rx in SHIP_TIME_RES:
-            m = rx.search(text)
-            if m:
-                info["shipping_time"] = " ".join(g.strip() for g in m.groups() if g)
+            hit = rx.search(text)
+            if hit:
+                info["shipping_time"] = " ".join(g.strip() for g in hit.groups() if g)
                 break
     if info["stock"] is None:
         for rx in STOCK_RES:
-            m = rx.search(text)
-            if m:
-                info["stock"] = int(m.group(1).replace(",", ""))
+            hit = rx.search(text)
+            if hit:
+                info["stock"] = int(hit.group(1).replace(",", ""))
                 break
     if info["in_stock"] is None:
         if OUT_OF_STOCK_RE.search(text):
@@ -369,7 +377,7 @@ def _from_text(text, info, source, listing=False):
             info["in_stock"] = True
 
 
-def _pack_size(title):
+def _pack_size(title: str) -> int:
     """Units per listing, e.g. '(30pcs)' or 'Pack of 10'. Title-only: page text is too noisy."""
     for rx in PACK_RES:
         m = rx.search(title)
@@ -378,7 +386,7 @@ def _pack_size(title):
     return 1
 
 
-def apply_qty(r, qty):
+def apply_qty(r: Listing, qty: int) -> Listing:
     """Work out unit cost, packs to buy, order total and stock check for `qty` units."""
     breaks = sorted(set(r["price_breaks"]))
     r["price_breaks"] = [{"min_qty": q, "price": p} for q, p in breaks]
@@ -410,7 +418,7 @@ def apply_qty(r, qty):
     return r
 
 
-def _blank_info():
+def _blank_info() -> Listing:
     """Empty per-listing info dict with every field part_info / apply_qty expect."""
     return {"cost": None, "currency": None, "cost_source": None, "supplier": None,
             "shipping_time": None, "shipping_cost": None, "free_ship_min": None,
@@ -422,7 +430,7 @@ def _blank_info():
 
 
 
-def part_info(result):
+def part_info(result: Listing) -> Listing:
     """Fetch a result page and pull cost / supplier / shipping details."""
     domain = urlparse(result["url"]).netloc.lower().removeprefix("www.")
     info = _blank_info()
@@ -462,7 +470,7 @@ def part_info(result):
     return {**result, **info}
 
 
-def enrich(results):
+def enrich(results: list[Listing]) -> list[Listing]:
     """Run part_info over all results in parallel (up to 10 pages at once)."""
     with ThreadPoolExecutor(max_workers=min(10, len(results) or 1)) as pool:
         return list(pool.map(part_info, results))
@@ -476,7 +484,7 @@ score_all, pick_top = SCORER.score_all, SCORER.pick_top
 
 
 
-def main():
+def main() -> None:
     """Command-line entry point: search, scrape, score and print or dump JSON."""
     p = argparse.ArgumentParser(
         prog="python -m scrapers.regex_scraper",
@@ -558,7 +566,7 @@ def main():
           f'(via {source}; {stats["fetched"]} pages read, {stats["priced"]} with prices; '
           f'ranked by {a.rank})\n')
 
-    def money(v, cur):
+    def money(v: float | None, cur: str | None) -> str:
         """Format an amount with its currency, or "n/a"."""
         return "n/a" if v is None else f"{v:,.2f} {cur or ''}".strip()
 

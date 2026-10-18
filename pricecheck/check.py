@@ -51,17 +51,19 @@ Usage:
 import argparse
 import re
 import sys
+from collections.abc import Callable, Sequence
 from urllib.parse import urlparse
 
 from scrapers import llm_scraper
 from scrapers.env import load_env
+from scrapers.listing import Listing
 
 from .alert import alert_blocks, format_alert, money
-from .ledger import log_alert
-from .comparison import compare
+from .comparison import Finding, compare
 from .config import Config
 from .joblog import claim_once, discover, enqueue, mark_done, queued
-from .notion import Notion, open_rows, parse_row, skip_reason
+from .ledger import log_alert
+from .notion import Notion, Row, open_rows, parse_row, skip_reason
 from .slack import Slack, slack_user
 
 # A sweep stops after this many rows in a row got no price because search / the LLM was
@@ -69,7 +71,7 @@ from .slack import Slack, slack_user
 MAX_OUTAGE_ROWS = 3
 
 
-def _outage(results):
+def _outage(results: list[Listing]) -> bool:
     """True when nothing got a price and the LLM failed on the pages: a quota / outage, not
     a part nobody sells, so the row should be tried again later."""
     return not any(r.get("subtotal") is not None for r in results) and \
@@ -85,12 +87,14 @@ class Checker:
     `find(row)` returns llm_scraper.find-style scored results.
     """
 
-    def __init__(self, cfg, notion, slack, find, dry_run=False, verbose=False):
+    def __init__(self, cfg: Config, notion: Notion, slack: Slack | None,
+                 find: Callable[[Row], list[Listing]], dry_run: bool = False,
+                 verbose: bool = False) -> None:
         self.cfg, self.notion, self.slack, self.find = cfg, notion, slack, find
         self.dry_run, self.verbose = dry_run, verbose
-        self._emails = None
+        self._emails: dict[str, str | None] | None = None
 
-    def notion_emails(self):
+    def notion_emails(self) -> dict[str, str | None]:
         """Notion user id -> email, fetched once (people properties may omit emails)."""
         if self._emails is None:
             try:
@@ -100,7 +104,7 @@ class Checker:
                 self._emails = {}
         return self._emails
 
-    def check(self, row, label=None):
+    def check(self, row: Row, label: str | None = None) -> str:
         label = label or f"{row.part_number} x{row.units} @ ${money(row.unit_price)}"
         reason = skip_reason(row, self.cfg)
         if reason:
@@ -122,12 +126,13 @@ class Checker:
             return "ok"
         return "alerted" if self._alert(f, label) else "ok"
 
-    def drain(self, entries):
+    def drain(self, entries: Sequence[tuple[str | None, str]]) -> dict[str, int]:
         """Check queued rows [(Job Log entry id, page id)] in order. Entries are marked done
         once their row is checked, skipped or gone; failures stay queued, and the run stops
         after MAX_OUTAGE_ROWS of them in a row. An entry id of None (a dry-run preview of a
         row discovery would queue) is checked but not marked. Returns {status: count}."""
-        counts, outages = {}, 0
+        counts: dict[str, int] = {}
+        outages = 0
         for i, (entry, pid) in enumerate(entries, 1):
             try:
                 row = parse_row(self.notion.page(pid))
@@ -154,10 +159,11 @@ class Checker:
                     print(f"  couldn't mark queue entry {entry} done: {e}", file=sys.stderr)
         return counts
 
-    def check_all(self, rows):
+    def check_all(self, rows: Sequence[Row]) -> dict[str, int]:
         """Sweep `rows` in order; stops after MAX_OUTAGE_ROWS retries in a row.
         Returns {status: count}."""
-        counts, outages = {}, 0
+        counts: dict[str, int] = {}
+        outages = 0
         for i, row in enumerate(rows, 1):
             status = self.check(row, f"[{i}/{len(rows)}] {row.part_number} x{row.units} "
                                      f"@ ${money(row.unit_price)}")
@@ -169,7 +175,7 @@ class Checker:
                 break
         return counts
 
-    def _alert(self, f, label):
+    def _alert(self, f: Finding, label: str) -> bool:
         """Claim the alert in the Job Log, then DM the row's contacts (or print it).
         False if it was already sent."""
         row, text, cfg = f.row, format_alert(f), self.cfg
@@ -194,27 +200,29 @@ class Checker:
             print(f"  no Slack match for {[c['name'] for c in row.contacts]} and no "
                   f"PRICE_CHECK_CHANNEL - alert not sent:\n{text}", file=sys.stderr)
         sent = False
-        for t in targets:
-            try:
-                self.slack.post(t, text, blocks)
-                sent = True
-            except RuntimeError as e:
-                print(f"  Slack post to {t} failed: {e}", file=sys.stderr)
+        if self.slack is not None:  # main() always has Slack outside a dry run
+            for t in targets:
+                try:
+                    self.slack.post(t, text, blocks)
+                    sent = True
+                except RuntimeError as e:
+                    print(f"  Slack post to {t} failed: {e}", file=sys.stderr)
         if sent:
             log_alert(self.notion, cfg, f)
         return True
 
 
-def make_find(llm, cfg, verbose=False):
+def make_find(llm: llm_scraper.LLM, cfg: Config,
+              verbose: bool = False) -> Callable[[Row], list[Listing]]:
     """find(row) for Checker: search the part at the row's quantity, always reading its link."""
-    def find(row):
+    def find(row: Row) -> list[Listing]:
         extra = [{"title": row.name or row.part_number, "url": row.link}] if row.link else []
         return llm_scraper.find(row.part_number, row.units, llm, pool=cfg.pool, extra=extra,
                              verbose=verbose)[2]
     return find
 
 
-def _page_id(s):
+def _page_id(s: str) -> str:
     """A Notion page id from an id or a notion.so URL (".../Title-<32 hex>?pvs=4")."""
     tail = urlparse(s).path.rstrip("/").rsplit("/", 1)[-1] if "://" in s else s.strip()
     m = re.search(r"([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
@@ -222,7 +230,7 @@ def _page_id(s):
     return m.group(1) if m else s
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser(
         prog="python -m pricecheck.check",
         description="Price-check Purchasing rows and DM the orderer when the price moved.")
@@ -253,7 +261,7 @@ def main():
         if found:
             print(f"Price check: {len(found)} new row(s) "
                   f"{'would be ' if a.dry_run else ''}queued.", file=sys.stderr)
-        entries = queued(notion, cfg, a.limit or cfg.batch)
+        entries: list[tuple[str | None, str]] = list(queued(notion, cfg, a.limit or cfg.batch))
         if a.dry_run:  # nothing was written: preview the rows discovery found too
             entries += [(None, pid) for pid in found]
             entries = entries[:a.limit or cfg.batch]

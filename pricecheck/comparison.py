@@ -1,35 +1,37 @@
 """Compare a row's Unit cost with the prices found for it."""
 from dataclasses import dataclass
 
+from scrapers.listing import Listing
 from scrapers.ranking import Scorer
 from scrapers.regex_scraper import _same_url
 
+from .config import Config
 from .notion import Row
 
 
 @dataclass
 class Finding:
     row: Row
-    found: dict            # the listing whose price is compared with the row
+    found: Listing         # the listing whose price is compared with the row
     at_link: bool          # found is the row's own product link
     delta_pct: float       # (found - sheet) / sheet x 100
-    cheaper: dict = None   # a better-priced option than `found`, if one was seen
+    cheaper: Listing | None = None  # a better-priced option than `found`, if one was seen
 
     @property
-    def found_unit(self):
+    def found_unit(self) -> float:
         return self.found["unit_cost"]
 
 
-def _comparable(r):
+def _comparable(r: Listing) -> bool:
     """A priced USD listing of the right part with enough stock."""
-    return (r.get("unit_cost") and r.get("score") is not None
+    return bool(r.get("unit_cost") and r.get("score") is not None
             and (r.get("currency") or "USD") == "USD"
             and r.get("enough_stock") is not False
             and not any(n == "part number not in listing" or n.startswith("priced in")
                         for n in r.get("notes", [])))
 
 
-def compare(row, results, cfg):
+def compare(row: Row, results: list[Listing], cfg: Config) -> Finding | None:
     """A Finding when the found price moved past the thresholds, else None."""
     link = next((r for r in results if row.link and _same_url(r["url"], row.link)
                  and r.get("unit_cost") and (r.get("currency") or "USD") == "USD"), None)
