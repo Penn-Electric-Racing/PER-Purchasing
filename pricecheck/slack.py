@@ -1,6 +1,7 @@
 """Slack: post the alert, and find the Slack user for a Notion person."""
 import re
 import unicodedata
+from typing import Any, Callable
 
 import requests
 
@@ -8,13 +9,16 @@ from .api import TIMEOUT, send
 
 SLACK_API = "https://slack.com/api"
 
+# A Slack member: (user id, [real name, display name, handle], email or None).
+Member = tuple[str, list[str], str | None]
+
 
 class Slack:
-    def __init__(self, token):
+    def __init__(self, token: str) -> None:
         self.headers = {"Authorization": f"Bearer {token}"}
-        self._directory = None
+        self._directory: list[Member] | None = None
 
-    def _call(self, method, http="post", **params):
+    def _call(self, method: str, http: str = "post", **params: Any) -> dict[str, Any]:
         fn = requests.post if http == "post" else requests.get
         kw = {"json": params} if http == "post" else {"params": params}
         r = send(fn, f"{SLACK_API}/{method}", headers=self.headers, timeout=TIMEOUT, **kw)
@@ -23,19 +27,19 @@ class Slack:
             raise RuntimeError(f"Slack {method}: {data.get('error', r.status_code)}")
         return data
 
-    def post(self, channel, text, blocks=None):
+    def post(self, channel: str, text: str, blocks: list[dict[str, Any]] | None = None) -> None:
         # A user id as channel DMs that user (chat:write only, as PERBot's jobs do). With
         # blocks, `text` is the notification / fallback.
-        params = {"blocks": blocks} if blocks else {}
+        params: dict[str, Any] = {"blocks": blocks} if blocks else {}
         self._call("chat.postMessage", channel=channel, text=text, unfurl_links=False, **params)
 
-    def lookup_email(self, email):
+    def lookup_email(self, email: str) -> str | None:
         try:
             return self._call("users.lookupByEmail", http="get", email=email)["user"]["id"]
         except (RuntimeError, KeyError):
             return None
 
-    def directory(self):
+    def directory(self) -> list[Member]:
         """Slack members as [(id, [names], email)] (cached)."""
         if self._directory is None:
             self._directory, cursor = [], None
@@ -56,13 +60,13 @@ class Slack:
         return self._directory
 
 
-def _norm(s):
+def _norm(s: str) -> str:
     s = unicodedata.normalize("NFD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
 
-def match_by_name(name, directory):
+def match_by_name(name: str, directory: list[Member]) -> str | None:
     """PERBot's identity.ts matchByName: exact name, unique token subset, or unique surname +
     first initial. Ambiguous matches return None (never guessed)."""
     norm = _norm(name)
@@ -85,7 +89,8 @@ def match_by_name(name, directory):
     return None
 
 
-def slack_user(slack, contact, notion_emails):
+def slack_user(slack: Slack, contact: dict[str, Any],
+               notion_emails: Callable[[], dict[str, str | None]]) -> str | None:
     """Notion person -> Slack user id: email first, then a conservative name match."""
     email = (contact.get("email") or notion_emails().get(contact["id"]) or "").lower()
     if email:

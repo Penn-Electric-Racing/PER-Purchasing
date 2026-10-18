@@ -12,10 +12,13 @@ import os
 import random
 import sys
 import time
+from typing import Callable, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+from .listing import Listing
 
 TIMEOUT = 15
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -28,7 +31,7 @@ class BackendError(Exception):
 
 # ---------------------------------------------------------------- backends
 # Each backend pages through results until it has `n` (or runs out).
-def brave(query, n):
+def brave(query: str, n: int) -> list[Listing]:
     """Up to `n` results from the Brave Search API (needs BRAVE_API_KEY).
 
     Returns [{"title", "url", "snippet"}, ...]; raises BackendError if the first page fails.
@@ -36,11 +39,12 @@ def brave(query, n):
     key = os.getenv("BRAVE_API_KEY")
     if not key:
         raise BackendError("BRAVE_API_KEY not set")
-    out = []
+    out: list[Listing] = []
     for page in range(10):  # Brave: count <= 20, offset is a page index (max 9)
+        params: dict[str, str | int] = {"q": query, "count": 20, "offset": page}
         r = requests.get(
             "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": 20, "offset": page},
+            params=params,
             headers={"X-Subscription-Token": key, "Accept": "application/json"},
             timeout=TIMEOUT,
         )
@@ -57,12 +61,12 @@ def brave(query, n):
     return out[:n]
 
 
-def serper(query, n):
+def serper(query: str, n: int) -> list[Listing]:
     """Up to `n` Google results via Serper.dev (needs SERPER_API_KEY), 10 per request."""
     key = os.getenv("SERPER_API_KEY")
     if not key:
         raise BackendError("SERPER_API_KEY not set")
-    out = []
+    out: list[Listing] = []
     for page in range(1, min(-(-n // 10), 10) + 1):  # 10 per call = 1 credit each
         r = requests.post(
             "https://google.serper.dev/search",
@@ -82,18 +86,20 @@ def serper(query, n):
     return out[:n]
 
 
-def google_cse(query, n):
+def google_cse(query: str, n: int) -> list[Listing]:
     """Up to `n` (max 100) results from Google Programmable Search
     (needs GOOGLE_API_KEY and GOOGLE_CSE_ID), 10 per request.
     """
     key, cx = os.getenv("GOOGLE_API_KEY"), os.getenv("GOOGLE_CSE_ID")
-    if not (key and cx):
+    if not key or not cx:
         raise BackendError("GOOGLE_API_KEY / GOOGLE_CSE_ID not set")
-    out = []
+    out: list[Listing] = []
     for start in range(1, min(n, 100) + 1, 10):  # CSE: 10 per call, max 100 total
+        params: dict[str, str | int] = {"key": key, "cx": cx, "q": query, "num": 10,
+                                        "start": start}
         r = requests.get(
             "https://www.googleapis.com/customsearch/v1",
-            params={"key": key, "cx": cx, "q": query, "num": 10, "start": start},
+            params=params,
             timeout=TIMEOUT,
         )
         if r.status_code != 200:
@@ -108,7 +114,7 @@ def google_cse(query, n):
     return out[:n]
 
 
-def _clean_ddg_url(href):
+def _clean_ddg_url(href: str) -> str:
     # DDG sometimes wraps links: //duckduckgo.com/l/?uddg=<encoded>
     """Unwrap DuckDuckGo's //duckduckgo.com/l/?uddg=<url> redirect links."""
     if "duckduckgo.com/l/" in href:
@@ -118,7 +124,8 @@ def _clean_ddg_url(href):
     return href
 
 
-def _ddg_page(form, retries=2):
+def _ddg_page(form: dict[str, str],
+              retries: int = 2) -> tuple[list[Listing], dict[str, str] | None]:
     """POST one DDG HTML results page; return (results, next-page form data or None)."""
     last = None
     for attempt in range(retries + 1):
@@ -153,12 +160,12 @@ def _ddg_page(form, retries=2):
             snip = res.select_one(".result__snippet")
             results.append({
                 "title": a.get_text(strip=True),
-                "url": _clean_ddg_url(a.get("href", "")),
+                "url": _clean_ddg_url(str(a.get("href") or "")),
                 "snippet": snip.get_text(" ", strip=True) if snip else "",
             })
         nxt = None
         for f in soup.select("form"):
-            data = {i["name"]: i.get("value", "") for i in f.select("input[name]")}
+            data = {str(i["name"]): str(i.get("value") or "") for i in f.select("input[name]")}
             if "s" in data and "vqd" in data:  # the "Next" button's hidden form
                 nxt = data
         if results:
@@ -167,11 +174,12 @@ def _ddg_page(form, retries=2):
     raise BackendError(last or "unknown error")
 
 
-def duckduckgo(query, n):
+def duckduckgo(query: str, n: int) -> list[Listing]:
     """Up to `n` results from DuckDuckGo's HTML page (no key), following its
     "Next" form with a pause between pages. Keeps partial results if a later page fails.
     """
-    out, form = [], {"q": query}
+    out: list[Listing] = []
+    form: dict[str, str] | None = {"q": query}
     while form and len(out) < n:
         if out:
             time.sleep(1 + random.random())  # be gentle between pages
@@ -185,13 +193,13 @@ def duckduckgo(query, n):
     return out[:n]
 
 
-BACKENDS = [("brave", brave), ("serper", serper), ("google_cse", google_cse), ("duckduckgo", duckduckgo)]
+BACKENDS: list[tuple[str, Callable[[str, int], list[Listing]]]] = [("brave", brave), ("serper", serper), ("google_cse", google_cse), ("duckduckgo", duckduckgo)]
 
 
 MAX_PAGE_BYTES = 5_000_000
 
 
-def _fetch_html(url):
+def _fetch_html(url: str) -> str:
     """GET a page as text; refuse non-HTML (datasheet PDFs are common part-number hits)
     and stop reading after MAX_PAGE_BYTES."""
     with requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
@@ -213,12 +221,14 @@ def _fetch_html(url):
 
 
 # ---------------------------------------------------------------- search
-def search(query, n=5, verbose=False, variants=()):
+def search(query: str, n: int = 5, verbose: bool = False,
+           variants: Sequence[str] = ()) -> tuple[str, list[Listing]]:
     """Top `n` unique URLs from the first working backend, topping up with `variants`."""
-    errors = {}
+    errors: dict[str, str] = {}
     for name, fn in BACKENDS:
         try:
-            res, seen = [], set()
+            res: list[Listing] = []
+            seen: set[str] = set()
             for q in (query, *variants):
                 if len(res) >= n:
                     break
@@ -244,7 +254,7 @@ def search(query, n=5, verbose=False, variants=()):
     raise RuntimeError("All backends failed: " + json.dumps(errors, indent=2))
 
 
-def _search_help(msg):
+def _search_help(msg: str) -> str:
     """Search failure message, plus advice when DuckDuckGo is rate-limiting."""
     if "HTTP 202" in msg or "Connection reset" in msg or "challenge" in msg:
         msg += ("\n\nDuckDuckGo is rate-limiting this network (usually clears in "

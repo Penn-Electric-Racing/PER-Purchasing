@@ -16,6 +16,8 @@ from datetime import date, datetime
 from statistics import median
 from urllib.parse import unquote
 
+from .listing import Listing
+
 
 @dataclass
 class Weights:
@@ -34,7 +36,7 @@ class Weights:
     # Confidence in where the price came from (regex_scraper.py: json-ld/meta/page text/snippet,
     # llm_scraper.py: llm/llm snippet, both: api = Mouser/DigiKey APIs).
     # Unlisted sources get unknown_source.
-    source: dict = field(default_factory=lambda: {
+    source: dict[str, float] = field(default_factory=lambda: {
         "json-ld": 1.0, "meta": 1.0, "page text": 1.05, "snippet": 1.15,
         "llm": 1.02, "llm snippet": 1.15, "api": 1.0})
     unknown_source: float = 1.1
@@ -47,7 +49,7 @@ class Weights:
     per_search_rank: float = 0.005   # tiny tiebreak favouring higher search positions
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path: str) -> "Weights":
         """Defaults overridden by a JSON file of {"weight name": value}."""
         with open(path) as f:
             data = json.load(f)
@@ -64,12 +66,12 @@ class Weights:
 
 
 # ---------------------------------------------------------------- helpers
-def _alnum(s):
+def _alnum(s: str) -> str:
     """Lowercase letters and digits only, for loose matching ("LM-317" -> "lm317")."""
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def relevance(query, r):
+def relevance(query: str, r: Listing) -> tuple[float, bool, list[str]]:
     """(fraction of query words found, part-number match, variant codes seen instead).
     Part numbers = words with digits. If a part number only shows up inside a longer
     code (LM317L for LM317), that's a variant: maybe the same part in another package,
@@ -89,7 +91,7 @@ def relevance(query, r):
     return (len(found) / len(words) if words else 1.0), key_hit, variants
 
 
-def ship_days(text, today=None):
+def ship_days(text: str | None, today: date | None = None) -> int | None:
     """Rough worst-case days until delivery from a shipping_time string."""
     if not text:
         return None
@@ -114,7 +116,7 @@ def ship_days(text, today=None):
     return None
 
 
-def ship_value(ship):
+def ship_value(ship: str | None) -> float | None:
     """Shipping cost string ("Free", "$5.99", "4.50 USD") as a number, else None."""
     if ship == "Free":
         return 0.0
@@ -132,11 +134,12 @@ class Scorer:
         scorer.score_all(results, query, qty)
         top = scorer.pick_top(results, 5)
     """
-    def __init__(self, weights=None):
+    def __init__(self, weights: Weights | None = None) -> None:
         """Use `weights`, or the defaults from Weights()."""
         self.w = weights or Weights()
 
-    def multiplier(self, r, qty, med_unit=None, n_units=0):
+    def multiplier(self, r: Listing, qty: int, med_unit: float | None = None,
+                   n_units: int = 0) -> float:
         """Penalty multiplier for one priced candidate; appends to r["notes"]."""
         w, mult, notes = self.w, 1.0, r["notes"]
         if r["enough_stock"] is False and r["in_stock"] is False:
@@ -168,7 +171,7 @@ class Scorer:
         mult *= 1 + w.per_search_rank * r["search_rank"]
         return mult
 
-    def score_all(self, results, query, qty):
+    def score_all(self, results: list[Listing], query: str, qty: int) -> list[Listing]:
         """Attach score + human-readable notes to every priced, relevant candidate."""
         priced = [r for r in results if r["subtotal"] is not None]
         known_ship = [v for v in (ship_value(r["shipping_cost"]) for r in priced) if v is not None]
@@ -208,9 +211,10 @@ class Scorer:
         return results
 
     @staticmethod
-    def pick_top(results, top, mode="best", per_supplier=2):
+    def pick_top(results: list[Listing], top: int, mode: str = "best",
+                 per_supplier: int = 2) -> list[Listing]:
         """Best `top` options. Hard filters first; loosened only if too few candidates pass."""
-        def tier(r):
+        def tier(r: Listing) -> int:
             """Sort group: 0 ok, 1 not enough stock, 2 wrong part/currency, 3 unpriced."""
             if r["score"] is None:
                 return 3  # unpriced
@@ -224,7 +228,8 @@ class Scorer:
         key = (lambda r: r["effective_cost"]) if mode == "cheapest" else (lambda r: r["score"])
         ordered = sorted(results, key=lambda r: (tier(r), key(r) if tier(r) < 3 else -r["relevance"],
                                                  r["search_rank"]))
-        picked, per = [], Counter()
+        picked: list[Listing] = []
+        per: Counter[str] = Counter()
         for r in ordered:  # first pass: cap listings per supplier for variety
             if per[r["supplier"]] < per_supplier:
                 picked.append(r); per[r["supplier"]] += 1

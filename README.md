@@ -473,6 +473,7 @@ scrapers/              part search (also usable on its own)
   llm_scraper.py         LLM page reading, find() (used by the price check), CLI
   ranking.py             Weights, Scorer (score_all, pick_top), relevance, ship_days
   env.py                 loads .env
+  listing.py             type aliases (Listing = one purchase option)
 tests/
   test_listener.py       webhook signature/routing, settling, rate limit, worker, end to end
   test_price_check.py    row parsing, price comparison, identity, alerts (all faked)
@@ -497,6 +498,7 @@ All tests run offline. Network calls and the LLM are faked.
 ```bash
 pytest            # or: .venv/bin/python -m pytest
 pip install coverage && coverage run -m pytest && coverage report -m   # what's untested
+pip install mypy types-requests types-beautifulsoup4 && mypy   # type check (settings in pyproject.toml)
 ```
 
 ## Limitations
