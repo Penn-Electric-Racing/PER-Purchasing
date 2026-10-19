@@ -1,17 +1,10 @@
 """The Purchasing (PEFS) database: a small Notion client, its columns, and its rows."""
 import re
 from dataclasses import dataclass, field
-from typing import Any
 
 import requests
 
 from .api import TIMEOUT, send
-from .config import Config
-
-# A Notion API object (page, data source, query filter...) as parsed JSON.
-Page = dict[str, Any]
-# A page's properties: {column name: Notion property value}.
-Properties = dict[str, Any]
 
 NOTION_API = "https://api.notion.com/v1"
 
@@ -30,20 +23,18 @@ COL_EXPORTED = "Exported?"
 class Notion:
     """The few Notion API calls this job needs (data sources API, as PERBot uses)."""
 
-    def __init__(self, token: str, version: str) -> None:
+    def __init__(self, token, version):
         self.headers = {"Authorization": f"Bearer {token}", "Notion-Version": version,
                         "Content-Type": "application/json"}
 
-    def _call(self, method: str, path: str, body: dict[str, Any] | None = None) -> Page:
+    def _call(self, method, path, body=None):
         r = send(requests.request, method, NOTION_API + path, headers=self.headers, json=body,
                   timeout=TIMEOUT)
         if r.status_code != 200:
             raise RuntimeError(f"Notion {method} {path}: HTTP {r.status_code} {r.text[:300]}")
         return r.json()
 
-    def query(self, data_source_id: str, filter_: dict[str, Any] | None = None,
-              page_size: int = 100, sorts: list[dict[str, Any]] | None = None,
-              limit: int | None = None) -> list[Page]:
+    def query(self, data_source_id, filter_=None, page_size=100, sorts=None, limit=None):
         """Pages of a data source matching `filter_`, following pagination up to `limit`."""
         pages, cursor = [], None
         while True:
@@ -56,23 +47,23 @@ class Notion:
             if not cursor or page_size == 1 or (limit and len(pages) >= limit):
                 return pages[:limit] if limit else pages
 
-    def data_source(self, data_source_id: str) -> Page:
+    def data_source(self, data_source_id):
         """The data source object: its "properties" (column name -> {"id", "type", ...}) and
         "parent" (the database it belongs to)."""
         return self._call("GET", f"/data_sources/{data_source_id}")
 
-    def page(self, page_id: str) -> Page:
+    def page(self, page_id):
         return self._call("GET", f"/pages/{page_id}")
 
-    def update(self, page_id: str, properties: Properties) -> Page:
+    def update(self, page_id, properties):
         return self._call("PATCH", f"/pages/{page_id}", {"properties": properties})
 
-    def create(self, data_source_id: str, properties: Properties) -> Page:
+    def create(self, data_source_id, properties):
         return self._call("POST", "/pages", {
             "parent": {"type": "data_source_id", "data_source_id": data_source_id},
             "properties": properties})
 
-    def users(self) -> dict[str, str | None]:
+    def users(self):
         """Workspace people as {id: email} (needs the integration's user-email capability)."""
         out, cursor = {}, None
         while True:
@@ -95,7 +86,7 @@ class Row:
     quantity: int
     unit_cost: float
     link: str
-    contacts: list[dict[str, Any]] = field(default_factory=list)  # [{"id", "name", "email"}]
+    contacts: list = field(default_factory=list)  # [{"id", "name", "email"}]
     season: str = ""
     exported: bool = False
     parent_ds: str = ""   # the data source the page lives in
@@ -104,26 +95,26 @@ class Row:
     pack_size: int = 1
 
     @property
-    def units(self) -> int:
+    def units(self):
         return self.quantity * self.pack_size
 
     @property
-    def unit_price(self) -> float:
+    def unit_price(self):
         return self.unit_cost / self.pack_size
 
 
 PACK_NOTE_RE = re.compile(r"Sold in packs of (\d+)")
 
 
-def plain_text(prop: dict[str, Any] | None) -> str:
+def plain_text(prop):
     return "".join(t.get("plain_text", "") for t in (prop or {}).get("rich_text")
                    or (prop or {}).get("title") or []).strip()
 
 
-def parse_row(page: Page) -> "Row":
+def parse_row(page):
     """A Purchasing page as a Row (field meanings as in PERBot's parsePurchasingRow)."""
     p = page.get("properties", {})
-    title: dict[str, Any] = next((v for v in p.values() if v.get("type") == "title"), {})
+    title = next((v for v in p.values() if v.get("type") == "title"), {})
     return Row(
         id=page["id"], url=page.get("url", ""), name=plain_text(title),
         part_number=plain_text(p.get(COL_PART)),
@@ -140,11 +131,11 @@ def parse_row(page: Page) -> "Row":
     )
 
 
-def _same_id(a: str, b: str) -> bool:
+def _same_id(a, b):
     return a.replace("-", "").lower() == b.replace("-", "").lower()
 
 
-def skip_reason(row: Row, cfg: Config) -> str | None:
+def skip_reason(row, cfg):
     """Why this row isn't price-checked (not Purchasing, ordered, other season, incomplete),
     or None if it should be."""
     if row.parent_ds and not _same_id(row.parent_ds, cfg.purchasing_ds):
@@ -158,7 +149,7 @@ def skip_reason(row: Row, cfg: Config) -> str | None:
     return None
 
 
-def open_filter(cfg: Config) -> list[dict[str, Any]]:
+def open_filter(cfg):
     """This season's not-yet-ordered rows with enough filled in to price-check."""
     return [
         {"property": COL_SEASON, "select": {"equals": cfg.season}},
@@ -169,7 +160,7 @@ def open_filter(cfg: Config) -> list[dict[str, Any]]:
     ]
 
 
-def open_rows(notion: Notion, cfg: Config, limit: int | None = None) -> list[Row]:
+def open_rows(notion, cfg, limit=None):
     """Every open row (oldest first), for a manual sweep."""
     return [parse_row(pg) for pg in notion.query(cfg.purchasing_ds, {"and": open_filter(cfg)},
                                                  sorts=[{"timestamp": "created_time",

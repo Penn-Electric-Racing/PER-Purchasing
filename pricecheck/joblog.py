@@ -7,15 +7,13 @@ entry stays as the "already seen" record, so a row is never queued twice.
 import sys
 from datetime import datetime, timedelta, timezone
 
-from .config import Config
-from .notion import Notion, open_filter, plain_text
+from .notion import open_filter, plain_text
 
 QUEUE_JOB = "price-check-queue"
 DONE_JOB = "price-check-done"
 
 
-def claim_once(notion: Notion, cfg: Config, key: str, job: str = "price-check",
-               dry_run: bool = False) -> bool:
+def claim_once(notion, cfg, key, job="price-check", dry_run=False):
     """PERBot's utils/schedule.ts claimOnce: True if this is the first claim of `key` in the
     Job Log (go ahead and alert), False if it's already there. Claimed BEFORE sending, so a
     crash mid-send counts as sent rather than double-DMing someone."""
@@ -34,22 +32,21 @@ def claim_once(notion: Notion, cfg: Config, key: str, job: str = "price-check",
 
 
 # ---------------------------------------------------------------- queue (Job Log)
-def queue_key(page_id: str) -> str:
+def queue_key(page_id):
     return f"{QUEUE_JOB} {page_id}"
 
 
-def enqueue(notion: Notion, cfg: Config, page_id: str) -> bool:
+def enqueue(notion, cfg, page_id):
     """Queue a row, as PERBot does (no-op if it's already queued). True if newly queued."""
     return claim_once(notion, cfg, queue_key(page_id), job=QUEUE_JOB)
 
 
-def mark_done(notion: Notion, entry_id: str) -> None:
+def mark_done(notion, entry_id):
     """Mark a queue entry checked; it stays in the Job Log so the row isn't queued again."""
     notion.update(entry_id, {"Job": {"rich_text": [{"text": {"content": DONE_JOB}}]}})
 
 
-def discover(notion: Notion, cfg: Config, now: datetime | None = None,
-             dry_run: bool = False) -> list[str]:
+def discover(notion, cfg, now=None, dry_run=False):
     """Queue open, complete Purchasing rows created in the last cfg.lookback_hours that were
     never queued (rows from /parts are usually queued by PERBot already). Returns the page
     ids newly queued (with dry_run: the ones that would be)."""
@@ -63,13 +60,13 @@ def discover(notion: Notion, cfg: Config, now: datetime | None = None,
             if claim_once(notion, cfg, queue_key(pg["id"]), job=QUEUE_JOB, dry_run=dry_run)]
 
 
-def queued(notion: Notion, cfg: Config, limit: int | None = None) -> list[tuple[str, str]]:
+def queued(notion, cfg, limit=None):
     """Queued rows, oldest first: [(Job Log entry id, Purchasing page id)]."""
     if not cfg.job_log_ds:
         sys.exit("NOTION_JOB_LOG_DS_ID is empty: the queue lives in the Job Log.")
     entries = notion.query(cfg.job_log_ds, {"property": "Job", "rich_text": {"equals": QUEUE_JOB}},
                            sorts=[{"property": "Ran at", "direction": "ascending"}], limit=limit)
-    out: list[tuple[str, str]] = []
+    out = []
     for e in entries:
         key = plain_text((e.get("properties") or {}).get("Run key"))
         if key.startswith(QUEUE_JOB + " "):

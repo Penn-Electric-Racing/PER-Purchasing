@@ -27,12 +27,12 @@ class Config:
     ledger_ds: str = DEFAULT_LEDGER_DS
 
     @classmethod
-    def from_env(cls, need_slack: bool = True) -> "Config":
+    def from_env(cls, need_slack=True):
         """Read the PERBot-compatible environment; exits with a message if a token is missing."""
-        def env(name: str, default: str = "") -> str:
+        def env(name, default=""):
             return (os.getenv(name) or "").strip() or default
 
-        def number(name: str, default: float) -> float:
+        def number(name, default):
             try:
                 return float(env(name, str(default)))
             except ValueError:

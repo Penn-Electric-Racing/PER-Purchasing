@@ -36,9 +36,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
 from urllib.parse import urlparse
 
 import requests
@@ -46,14 +44,13 @@ from bs4 import BeautifulSoup
 
 from . import distributors
 from .env import load_env
-from .listing import Listing
 from .ranking import Scorer, Weights
 from .ranking import ship_value as _ship_value
 from .regex_scraper import LISTING_URL_RE, _blank_info, _to_float
 from .websearch import BackendError, _fetch_html, _search_help, search
 
 # provider -> (base url, api key env var or None, default model)
-PROVIDERS: dict[str, tuple[str, str | None, str]] = {
+PROVIDERS = {
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai",
                "GEMINI_API_KEY", "gemini-3.1-flash-lite"),
     "groq": ("https://api.groq.com/openai/v1",
@@ -100,8 +97,7 @@ class LLMError(Exception):
 class LLM:
     """Minimal OpenAI-compatible chat client with request pacing and 429 retries."""
 
-    def __init__(self, provider: str | None = None, model: str | None = None, rpm: float = 15,
-                 verbose: bool = False) -> None:
+    def __init__(self, provider=None, model=None, rpm=15, verbose=False):
         """Pick the provider (given, else the first with an API key, else a running
         Ollama), its key and model, and set up pacing to `rpm` requests per minute.
         Raises LLMError if none is usable.
@@ -123,7 +119,7 @@ class LLM:
         self.gap, self.next_at, self.lock = 60.0 / rpm, 0.0, threading.Lock()
         self.verbose = verbose
 
-    def _wait_turn(self) -> None:
+    def _wait_turn(self):
         """Block until this thread may send its next request (shared across threads)."""
         with self.lock:
             now = time.monotonic()
@@ -131,7 +127,7 @@ class LLM:
             self.next_at = at + self.gap
         time.sleep(at - now)
 
-    def json(self, system: str, user: str, retries: int = 4) -> Any:
+    def json(self, system, user, retries=4):
         """Send one chat request and return the reply parsed as a JSON object.
 
         Retries 429/5xx (honouring Retry-After), network errors and non-JSON replies up
@@ -171,7 +167,7 @@ class LLM:
         raise LLMError(last or "unknown error")
 
 
-def _ollama_up() -> bool:
+def _ollama_up():
     """True if an Ollama server answers on localhost:11434."""
     try:
         return requests.get("http://localhost:11434/api/tags", timeout=1).ok
@@ -180,7 +176,7 @@ def _ollama_up() -> bool:
 
 
 # ---------------------------------------------------------------- page -> prompt
-def page_text(html: str) -> tuple[str, str, str]:
+def page_text(html):
     """(h1 title, JSON-LD text, visible text near the product) from raw HTML."""
     soup = BeautifulSoup(html, "html.parser")
     ld = " ".join((t.string or "").strip()
@@ -198,13 +194,13 @@ def page_text(html: str) -> tuple[str, str, str]:
     return title, re.sub(r"\s+", " ", ld)[:LD_CHARS], text[start:start + PAGE_CHARS]
 
 
-def _num(v: object) -> float | None:
+def _num(v):
     """A non-negative number from the LLM's JSON, else None (booleans and junk rejected)."""
     v = _to_float(v) if not isinstance(v, bool) else None
     return v if v is not None and v >= 0 else None
 
 
-def to_info(d: dict[str, Any], info: Listing, source: str) -> Listing:
+def to_info(d, info, source):
     """Validate the LLM's JSON and copy it into regex_scraper.py's info dict."""
     cost = _num(d.get("cost"))
     if cost:  # 0 = "call for price"
@@ -241,7 +237,7 @@ def to_info(d: dict[str, Any], info: Listing, source: str) -> Listing:
     return info
 
 
-def _read_page(result: Listing) -> tuple[Listing, str]:
+def _read_page(result):
     """Fetch a result page: (info with fetch_error if it failed, prompt text for the LLM)."""
     info = _blank_info()
     info["listing_page"] = bool(LISTING_URL_RE.search(result["url"]))
@@ -265,8 +261,7 @@ def _read_page(result: Listing) -> tuple[Listing, str]:
     return info, prompt
 
 
-def _finish(result: Listing, info: Listing, reply: dict[str, Any] | None = None,
-            error: LLMError | str | None = None) -> Listing:
+def _finish(result, info, reply=None, error=None):
     """Merge one page's LLM reply (or the LLM error) into its result dict."""
     source = info.pop("_source")
     if reply is not None:
@@ -284,8 +279,7 @@ BATCH_SYSTEM = SYSTEM.replace(
      'keys...}, ... ]} with one entry per listing, never mixing details between listings.')
 
 
-def _ask(results: list[Listing], pages: list[tuple[Listing, str]], llm: LLM,
-         query: str) -> list[Listing]:
+def _ask(results, pages, llm, query):
     """One LLM request for a group of fetched pages; returns their finished result dicts."""
     if len(results) == 1:
         try:
@@ -306,7 +300,7 @@ def _ask(results: list[Listing], pages: list[tuple[Listing, str]], llm: LLM,
             for i, (r, (info, _)) in enumerate(zip(results, pages))]
 
 
-def pages_info(results: list[Listing], llm: LLM, query: str, batch: int = 1) -> list[Listing]:
+def pages_info(results, llm, query, batch=1):
     """Fetch every result page, then have the LLM read them `batch` pages per request."""
     with ThreadPoolExecutor(max_workers=min(10, len(results) or 1)) as pool:
         pages = list(pool.map(_read_page, results))
@@ -316,12 +310,12 @@ def pages_info(results: list[Listing], llm: LLM, query: str, batch: int = 1) -> 
     return [r for group in done for r in group]
 
 
-def part_info(result: Listing, llm: LLM, query: str) -> Listing:
+def part_info(result, llm, query):
     """Fetch one result page and have the LLM pull cost / supplier / shipping details."""
     return pages_info([result], llm, query)[0]
 
 
-def snippets_info(results: list[Listing], llm: LLM, query: str) -> list[Listing]:
+def snippets_info(results, llm, query):
     """--no-fetch: one LLM call over every search snippet."""
     listing = "\n".join(f"[{i}] {r['title']} | {r['url']} | {r['snippet']}"
                         for i, r in enumerate(results))
@@ -343,7 +337,7 @@ def snippets_info(results: list[Listing], llm: LLM, query: str) -> list[Listing]
     return out
 
 
-def apply_qty(r: Listing, qty: int) -> Listing:
+def apply_qty(r, qty):
     """regex_scraper.apply_qty, but with the LLM's pack size instead of a title regex."""
     breaks = sorted(set(r["price_breaks"]))
     r["price_breaks"] = [{"min_qty": q, "price": p} for q, p in breaks]
@@ -372,9 +366,8 @@ def apply_qty(r: Listing, qty: int) -> Listing:
 
 
 # ---------------------------------------------------------------- search + rank
-def find(base: str, qty: int, llm: LLM, scorer: Scorer | None = None, pool: int = 30,
-         api_n: int = 10, batch: int | None = None, exact: bool = False, no_fetch: bool = False,
-         verbose: bool = False, extra: Sequence[Listing] = ()) -> tuple[str, str, list[Listing]]:
+def find(base, qty, llm, scorer=None, pool=30, api_n=10, batch=None, exact=False,
+         no_fetch=False, verbose=False, extra=()):
     """Search, read and score every candidate for `qty` x `base`.
 
     `extra` are search-result dicts ({"title", "url", "snippet"}) always read alongside the
@@ -416,7 +409,7 @@ def find(base: str, qty: int, llm: LLM, scorer: Scorer | None = None, pool: int 
 
 
 # ---------------------------------------------------------------- main
-def main() -> None:
+def main():
     """Command-line entry point: search, LLM-extract, score and print or dump JSON."""
     p = argparse.ArgumentParser(
         prog="python -m scrapers.llm_scraper",
@@ -487,7 +480,7 @@ def main() -> None:
           f'(via {source} + {llm.provider}/{llm.model}; {stats["fetched"]} pages read, '
           f'{stats["priced"]} with prices; ranked by {a.rank})\n')
 
-    def money(v: float | None, cur: str | None) -> str:
+    def money(v, cur):
         """Format an amount with its currency, or "n/a"."""
         return "n/a" if v is None else f"{v:,.2f} {cur or ''}".strip()
 
