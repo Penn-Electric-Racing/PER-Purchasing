@@ -4,7 +4,7 @@ import os
 ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 
 
-def load_env(path: str = ENV_FILE) -> None:
+def load_env(path=ENV_FILE):
     """Set KEY=value lines from a .env file (see .env.example) as environment variables.
     Blank values, comments and variables already set in the shell are left alone."""
     try:

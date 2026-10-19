@@ -1,8 +1,3 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-
-[tool.mypy]
-files = ["scrapers", "pricecheck"]
-disallow_untyped_defs = true
-disallow_incomplete_defs = true

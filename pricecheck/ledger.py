@@ -9,19 +9,15 @@ PERBot finds the row again by Row ID + Old unit cost + Quant.: keep those as wri
 import json
 import sys
 from datetime import datetime, timezone
-from typing import Any
 
 from .alert import _HTTP_URL_RE, _notion_price, alert_buttons
-from .comparison import Finding
-from .config import Config
-from .notion import Notion, Properties
 
 
-def _text(s: str) -> dict[str, Any]:
+def _text(s):
     return {"rich_text": [{"type": "text", "text": {"content": s[:2000]}}] if s else []}
 
 
-def offered(f: Finding) -> tuple[float, str, str]:
+def offered(f):
     """(unit cost in the row's units, supplier, listing url) of the option the alert puts
     first: its primary Use button, or the found price when it has no buttons."""
     buttons = alert_buttons(f)
@@ -35,7 +31,7 @@ def offered(f: Finding) -> tuple[float, str, str]:
             f.found.get("url") or "")
 
 
-def ledger_props(f: Finding, now: datetime | None = None) -> Properties:
+def ledger_props(f, now=None):
     """Notion properties for the alert's ledger row."""
     row = f.row
     n, supplier, listing = offered(f)
@@ -62,7 +58,7 @@ def ledger_props(f: Finding, now: datetime | None = None) -> Properties:
     return props
 
 
-def log_alert(notion: Notion, cfg: Config, f: Finding, now: datetime | None = None) -> bool:
+def log_alert(notion, cfg, f, now=None):
     """Write the alert to the ledger. Never raises: a missed ledger row only costs a
     statistic (PERBot creates it on the first click anyway)."""
     if not cfg.ledger_ds:

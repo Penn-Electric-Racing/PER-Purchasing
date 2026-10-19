@@ -50,9 +50,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
 from urllib.parse import unquote
 
 from scrapers import llm_scraper
@@ -75,7 +73,7 @@ RETRY_MAX_SECONDS = 6 * 3600  # ...up to 6 h
 MAX_BODY_BYTES = 1_000_000
 
 
-def log(msg: str) -> None:
+def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
@@ -83,16 +81,15 @@ def log(msg: str) -> None:
 class Settling:
     """Pages waiting for their edits to settle: {page id: due time}. Thread-safe."""
 
-    def __init__(self, clock: Callable[[], float] = time.time) -> None:
-        self.clock, self.lock = clock, threading.Lock()
-        self.due: dict[str, float] = {}
+    def __init__(self, clock=time.time):
+        self.clock, self.lock, self.due = clock, threading.Lock(), {}
 
-    def touch(self, page_id: str, delay: float) -> None:
+    def touch(self, page_id, delay):
         """(Re)start the wait for a page: `delay` seconds after its latest event."""
         with self.lock:
             self.due[page_id] = self.clock() + delay
 
-    def pop_due(self) -> list[str]:
+    def pop_due(self):
         """Pages whose wait is over, earliest first."""
         with self.lock:
             now = self.clock()
@@ -101,7 +98,7 @@ class Settling:
                 del self.due[pid]
             return [pid for _, pid in ready]
 
-    def __len__(self) -> int:
+    def __len__(self):
         with self.lock:
             return len(self.due)
 
@@ -109,23 +106,22 @@ class Settling:
 class HourlyLimit:
     """At most `per_hour` starts in any rolling hour."""
 
-    def __init__(self, per_hour: int, clock: Callable[[], float] = time.time) -> None:
-        self.per_hour, self.clock = per_hour, clock
-        self.starts: deque[float] = deque()
+    def __init__(self, per_hour, clock=time.time):
+        self.per_hour, self.clock, self.starts = per_hour, clock, deque()
 
-    def wait(self) -> float:
+    def wait(self):
         """Seconds until another start is allowed (0 = now)."""
         now = self.clock()
         while self.starts and self.starts[0] <= now - 3600:
             self.starts.popleft()
         return 0 if len(self.starts) < self.per_hour else self.starts[0] + 3600 - now
 
-    def record(self) -> None:
+    def record(self):
         self.starts.append(self.clock())
 
 
 # ---------------------------------------------------------------- webhook events
-def valid_signature(secret: str, body: bytes, header: str | None) -> bool:
+def valid_signature(secret, body, header):
     """Notion's X-Notion-Signature: "sha256=" + HMAC-SHA256(verification token, raw body)."""
     if not (secret and header):
         return False
@@ -133,11 +129,11 @@ def valid_signature(secret: str, body: bytes, header: str | None) -> bool:
     return hmac.compare_digest(expected, header)
 
 
-def _norm_id(s: str | None) -> str:
+def _norm_id(s):
     return (s or "").replace("-", "").lower()
 
 
-def relevant_property_ids(schema: dict[str, Any]) -> set[str]:
+def relevant_property_ids(schema):
     """Property ids (decoded) of PRICE_COLUMNS, from the data source's properties."""
     return {unquote(p["id"]) for name, p in schema.items() if name in PRICE_COLUMNS and p.get("id")}
 
@@ -145,16 +141,14 @@ def relevant_property_ids(schema: dict[str, Any]) -> set[str]:
 class Router:
     """Turns webhook events into settling pages."""
 
-    def __init__(self, cfg: Config, settling: Settling, settle: float,
-                 watched_parents: Iterable[str | None] = (),
-                 relevant_props: set[str] | None = None) -> None:
+    def __init__(self, cfg, settling, settle, watched_parents=(), relevant_props=None):
         self.settling, self.settle = settling, settle
         # Purchasing's data source id and its database id (events may name either).
         self.parents = {_norm_id(p) for p in (cfg.purchasing_ds, *watched_parents) if p}
         # Property ids of PRICE_COLUMNS; None = every edit counts.
         self.relevant = relevant_props
 
-    def handle(self, event: dict[str, Any]) -> str:
+    def handle(self, event):
         """Apply one event; returns a short description for the log."""
         kind = event.get("type", "")
         entity = event.get("entity") or {}
@@ -180,21 +174,19 @@ class Router:
 class Worker:
     """Queues settled rows, then drains the Job Log queue one row at a time."""
 
-    def __init__(self, cfg: Config, notion: Notion, checker: Checker, settling: Settling,
-                 limit: HourlyLimit, clock: Callable[[], float] = time.time,
-                 sleep: Callable[[float], None] = time.sleep, dry_run: bool = False) -> None:
+    def __init__(self, cfg, notion, checker, settling, limit, clock=time.time,
+                 sleep=time.sleep, dry_run=False):
         self.cfg, self.notion, self.checker = cfg, notion, checker
         self.settling, self.limit, self.clock, self.sleep = settling, limit, clock, sleep
         self.dry_run, self.stopped = dry_run, threading.Event()
         self.next_poll = 0.0       # look at the queue now (startup backlog, PERBot's entries)
         self.backoff_until = 0.0
         self.failures = 0
-        # startup: () -> page ids queued (joblog.discover)
-        self.catch_up: Callable[[], list[str]] | None = None
-        self.preview: list[str] = []   # dry run: rows that would have been queued...
-        self.seen: set[str] = set()    # ...and rows already checked (nothing is marked done)
+        self.catch_up = None       # startup: () -> page ids queued (joblog.discover)
+        self.preview = []          # dry run: rows that would have been queued...
+        self.seen = set()          # ...and rows already checked (nothing is marked done)
 
-    def queue_settled(self) -> int:
+    def queue_settled(self):
         """Queue settled rows that are open and complete. Returns how many were new."""
         added = 0
         for pid in self.settling.pop_due():
@@ -219,15 +211,14 @@ class Worker:
             self.next_poll = 0.0
         return added
 
-    def check_next(self) -> str | None:
+    def check_next(self):
         """Check the oldest queued row if the hourly limit and any backoff allow.
         Returns its status, or None if nothing was done."""
         now = self.clock()
         if now < self.backoff_until or now < self.next_poll or self.limit.wait() > 0:
             return None
-        waiting = [e for e in queued(self.notion, self.cfg, len(self.seen) + 1)
-                   if e[1] not in self.seen]
-        entries: list[tuple[str | None, str]] = list(waiting[:1])
+        entries = [e for e in queued(self.notion, self.cfg, len(self.seen) + 1)
+                   if e[1] not in self.seen][:1]
         if not entries and self.preview:
             entries = [(None, self.preview.pop(0))]
         if entries and self.dry_run:
@@ -248,11 +239,11 @@ class Worker:
                 self.limit.record()  # only real searches count against the limit
         return status
 
-    def step(self) -> str | None:
+    def step(self):
         self.queue_settled()
         return self.check_next()
 
-    def run(self) -> None:
+    def run(self):
         if self.catch_up:  # here rather than before serving, so the port opens right away
             try:
                 found = self.catch_up()
@@ -269,13 +260,12 @@ class Worker:
 
 
 # ---------------------------------------------------------------- HTTP
-def make_handler(router: Router, secret: str,
-                 status: Callable[[], dict[str, Any]]) -> type[BaseHTTPRequestHandler]:
+def make_handler(router, secret, status):
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, fmt: str, *args: Any) -> None:  # quiet default access log
+        def log_message(self, fmt, *args):  # quiet default access log
             pass
 
-        def _reply(self, code: int, body: dict[str, Any]) -> None:
+        def _reply(self, code, body):
             data = json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -283,12 +273,12 @@ def make_handler(router: Router, secret: str,
             self.end_headers()
             self.wfile.write(data)
 
-        def do_GET(self) -> None:
+        def do_GET(self):
             if self.path in ("/", "/healthz"):
                 return self._reply(200, {"ok": True, **status()})
             self._reply(404, {"error": "not found"})
 
-        def do_POST(self) -> None:
+        def do_POST(self):
             if self.path != "/notion/webhook":
                 return self._reply(404, {"error": "not found"})
             size = int(self.headers.get("Content-Length") or 0)
@@ -314,7 +304,7 @@ def make_handler(router: Router, secret: str,
     return Handler
 
 
-def main() -> None:
+def main():
     p = argparse.ArgumentParser(
         prog="python -m pricecheck",
         description="Price-check Purchasing rows as Notion reports them added or edited.")
@@ -351,7 +341,7 @@ def main() -> None:
     worker.catch_up = lambda: discover(notion, cfg, dry_run=a.dry_run)
     threading.Thread(target=worker.run, daemon=True).start()
 
-    def status() -> dict[str, Any]:
+    def status():
         return {"settling": len(settling), "checks_this_hour": len(worker.limit.starts)}
     if not secret:
         log("NOTION_WEBHOOK_SECRET not set: only the verification handshake will be accepted.")

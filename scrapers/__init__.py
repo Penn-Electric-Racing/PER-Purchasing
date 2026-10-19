@@ -7,7 +7,6 @@ Part search: find where to buy a part and what an order would cost.
     llm_scraper.py    reads each page with an LLM (CLI); find() is the price check's search
     ranking.py        scores the options (Weights) and picks the best (Scorer)
     env.py            loads API keys from .env
-    listing.py        type aliases: Listing (one purchase option), PriceBreaks
 
 Run a scraper from the project root:
 
@@ -15,7 +14,6 @@ Run a scraper from the project root:
     python -m scrapers.regex_scraper "LM7805" -q 50
 """
 from importlib import import_module
-from typing import Any
 
 # Public names -> the module that defines them. They are imported on first use (PEP 562),
 # so `python -m scrapers.llm_scraper` doesn't import its own module twice.
@@ -37,11 +35,11 @@ _EXPORTS = {
 __all__ = list(_EXPORTS)
 
 
-def __getattr__(name: str) -> Any:
+def __getattr__(name):
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     return getattr(import_module(f".{_EXPORTS[name]}", __name__), name)
 
 
-def __dir__() -> list[str]:
+def __dir__():
     return sorted([*globals(), *__all__])

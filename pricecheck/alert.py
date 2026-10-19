@@ -8,19 +8,11 @@ the View-listing link buttons (action ids price_swap_view:<i>), which Slack repo
 """
 import json
 import re
-from typing import Any
 
-from scrapers.listing import Listing
 from scrapers.regex_scraper import _same_url
 
-from .comparison import Finding
-from .notion import Row
 
-# A Slack Block Kit block or element, as JSON.
-Block = dict[str, Any]
-
-
-def money(n: float) -> str:
+def money(n):
     """Like PERBot's partFinder money(): 2 decimals, up to 4 for sub-dollar prices (0.0425)."""
     if n >= 1:
         return f"{n:,.2f}"
@@ -28,11 +20,11 @@ def money(n: float) -> str:
     return s + "0" * max(0, 2 - len(s.split(".")[1]))
 
 
-def _flags(r: Listing) -> list[str]:
+def _flags(r):
     return [n for n in r.get("notes", []) if n != "shipping cost estimated"]
 
 
-def price_break(r: Listing) -> str:
+def price_break(r):
     """" (25+ price)" when a quantity price break set this listing's unit price, else ""."""
     bought = (r.get("packs_needed") or 0) * (r.get("pack_size") or 1)
     tier = max((b["min_qty"] for b in r.get("price_breaks") or [] if b["min_qty"] <= bought),
@@ -40,7 +32,7 @@ def price_break(r: Listing) -> str:
     return f" ({tier}+ price)" if tier and tier > 1 else ""
 
 
-def format_alert(f: Finding) -> str:
+def format_alert(f):
     """Slack mrkdwn for one alert, in PERBot's style (emoji lead, <url|label> links)."""
     row, qty = f.row, f.row.units
     up = f.delta_pct > 0
@@ -76,18 +68,18 @@ BUTTON_TEXT_MAX = 75      # Slack's cap on a button label
 _HTTP_URL_RE = re.compile(r"^https?://\S+$", re.I)
 
 
-def _notion_price(unit_price: float, row: Row) -> float:
+def _notion_price(unit_price, row):
     """A per-unit price in the row's own units (per pack on pack rows), rounded as shown."""
     n = unit_price * row.pack_size
     return round(n, 2 if n >= 1 else 4)
 
 
-def _button_value(v: dict[str, Any]) -> str | None:
+def _button_value(v):
     s = json.dumps(v, separators=(",", ":"), ensure_ascii=False)
     return s if len(s) <= BUTTON_VALUE_MAX else None
 
 
-def _use_button(i: int, f: Finding, listing: Listing) -> Block | None:
+def _use_button(i, f, listing):
     """A "Use $X" button writing `listing`'s price to the row, or None when its value can't
     be carried (no price, a non-http link, or over Slack's size cap)."""
     row = f.row
@@ -118,7 +110,7 @@ def _use_button(i: int, f: Finding, listing: Listing) -> Block | None:
                         "deny": {"type": "plain_text", "text": "Not yet"}}}
 
 
-def alert_links(f: Finding) -> Block | None:
+def alert_links(f):
     """Link buttons that open each option's listing (flagged ones too: looking is harmless),
     so whoever clicks Use has checked the page. None when no listing has an http link."""
     options = [f.found] + ([f.cheaper] if f.cheaper else [])
@@ -134,7 +126,7 @@ def alert_links(f: Finding) -> Block | None:
     return {"type": "actions", "block_id": LINKS_BLOCK_ID, "elements": links} if links else None
 
 
-def alert_buttons(f: Finding) -> Block | None:
+def alert_buttons(f):
     """The alert's actions block: Use the found price, Use an unflagged cheaper option, and
     Keep the row's price. None when not even the found price can be a button."""
     options = [f.found] + ([f.cheaper] if f.cheaper and not _flags(f.cheaper) else [])
@@ -150,7 +142,7 @@ def alert_buttons(f: Finding) -> Block | None:
          "text": {"type": "plain_text", "text": keep_label[:BUTTON_TEXT_MAX]}}]}
 
 
-def alert_blocks(f: Finding, text: str | None = None) -> list[Block]:
+def alert_blocks(f, text=None):
     """Block Kit for the DM: the alert text, View-listing links, then Use / Keep."""
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text or format_alert(f)}}]
     return blocks + [b for b in (alert_links(f), alert_buttons(f)) if b]
