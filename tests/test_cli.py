@@ -128,9 +128,13 @@ class FakeLLM:
         return {"cost": 2.0, "currency": "USD"}
 
 
+# Shows every price FakeLLM returns (prices that aren't on the page are dropped).
+PRICED_PAGE = "<h1>LM7805</h1> $1.00 $2.00 $3.00"
+
+
 def test_find_reads_extra_links_and_dedupes(monkeypatch):
     fake_search(monkeypatch, llm_scraper)
-    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: "<h1>LM7805</h1>")
+    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: PRICED_PAGE)
     llm = FakeLLM()
     _, source, results = llm_scraper.find("LM7805", 5, llm, batch=1, extra=[
         {"title": "mine", "url": "https://mine.com/p"}, {"title": "dup", "url": HITS[0]["url"]}])
@@ -142,7 +146,7 @@ def test_find_reads_extra_links_and_dedupes(monkeypatch):
 
 def test_find_ranks_read_pages_without_reading_them_again(monkeypatch):
     fake_search(monkeypatch, llm_scraper)
-    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: "<h1>LM7805</h1>")
+    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: PRICED_PAGE)
     llm = FakeLLM()
     mine = {"title": "LM7805", "url": HITS[0]["url"], "snippet": "", "search_rank": 0,
             **regex_scraper._blank_info(), "cost": 3.0, "currency": "USD"}
@@ -164,7 +168,7 @@ def test_find_with_only_extra_links_when_search_fails(monkeypatch):
 def test_llm_scraper_main_json(monkeypatch, capsys):
     fake_search(monkeypatch, llm_scraper)
     monkeypatch.setattr(llm_scraper, "LLM", FakeLLM)
-    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: "<h1>LM7805</h1>")
+    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: PRICED_PAGE)
     run(llm_scraper, monkeypatch, "LM7805", "--json", "--batch", "3")
     data = json.loads(capsys.readouterr().out)
     assert data["llm"] == "fake/fake-model" and data["priced"] == 3
