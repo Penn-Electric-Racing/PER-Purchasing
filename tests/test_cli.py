@@ -140,6 +140,17 @@ def test_find_reads_extra_links_and_dedupes(monkeypatch):
     assert all(r["score"] is not None for r in results)
 
 
+def test_find_ranks_read_pages_without_reading_them_again(monkeypatch):
+    fake_search(monkeypatch, llm_scraper)
+    monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: "<h1>LM7805</h1>")
+    llm = FakeLLM()
+    mine = {"title": "LM7805", "url": HITS[0]["url"], "snippet": "", "search_rank": 0,
+            **regex_scraper._blank_info(), "cost": 3.0, "currency": "USD"}
+    _, _, results = llm_scraper.find("LM7805", 1, llm, batch=1, read=[mine])
+    assert len(llm.prompts) == 2  # the 2 other hits; the read page isn't fetched again
+    assert [r["cost"] for r in results if r["url"] == HITS[0]["url"]] == [3.0]
+
+
 def test_find_with_only_extra_links_when_search_fails(monkeypatch):
     fake_search(monkeypatch, llm_scraper, error="All backends failed")
     monkeypatch.setattr(llm_scraper, "_fetch_html", lambda url: "<h1>x</h1>")
@@ -254,8 +265,8 @@ def notion_env(monkeypatch):
     monkeypatch.setattr(llm_scraper, "LLM", FakeLLM)
     searched = []
 
-    def find(base, qty, llm, pool=15, extra=(), verbose=False, **k):
-        searched.append((base, qty, [e["url"] for e in extra]))
+    def find(base, qty, llm, pool=15, read=(), verbose=False, **k):
+        searched.append((base, qty, [e["url"] for e in read]))
         r = {"title": "LM7805", "url": "https://a.com/lm7805", "snippet": "", "search_rank": 0,
              **regex_scraper._blank_info(), "cost": 2.0, "currency": "USD", "cost_source": "llm",
              "supplier": "a.com", "in_stock": True}
@@ -263,6 +274,7 @@ def notion_env(monkeypatch):
         llm_scraper.Scorer().score_all(rs, base, qty)
         return "LM7805 price", "fake", rs
     monkeypatch.setattr(llm_scraper, "find", find)
+    monkeypatch.setattr(llm_scraper, "part_info", lambda r, llm, q: {**r, "mpn": None})
     return searched
 
 

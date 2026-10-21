@@ -4,9 +4,9 @@ check.py - re-price open Purchasing (PEFS) rows and DM the orderer when a price 
 
 Runs over the same Notion database PERBot writes to (/parts "Add to Purchasing") and reads
 (/benbuys prep): this season's rows that aren't ordered yet (Exported? unchecked) and have a
-part number, quantity and unit cost. For each row it searches the part with scrapers.find
-(web search + Mouser/DigiKey APIs + LLM page reading), always including the row's own
-product link, and compares the unit price found at that quantity with the row's Unit cost:
+part number, quantity and unit cost. For each row it reads the row's own product link first
+and searches the manufacturer part number shown there (else Cat. or model no.) with
+scrapers.find (web search + Mouser/DigiKey APIs + LLM page reading), and compares the unit price found at that quantity with the row's Unit cost:
 
   found price = the price at the row's own link if it could be read, else the best option
   alert when  |found - Unit cost| / Unit cost >= PRICE_CHECK_THRESHOLD_PCT
@@ -206,11 +206,21 @@ class Checker:
 
 
 def make_find(llm, cfg, verbose=False):
-    """find(row) for Checker: search the part at the row's quantity, always reading its link."""
+    """find(row) for Checker: search the part at the row's quantity, always reading its link.
+
+    The link is read first: Cat. or model no. is often a description ("M3 screws"), so the
+    manufacturer part number on the linked page is searched instead when it shows one."""
     def find(row):
-        extra = [{"title": row.name or row.part_number, "url": row.link}] if row.link else []
-        return llm_scraper.find(row.part_number, row.units, llm, pool=cfg.pool, extra=extra,
-                             verbose=verbose)[2]
+        term, read = row.part_number, []
+        if row.link:
+            link = llm_scraper.part_info({"title": row.name or row.part_number, "url": row.link,
+                                          "snippet": "", "search_rank": 0}, llm, row.part_number)
+            term, read = llm_scraper.search_term(link) or row.part_number, [link]
+            if verbose and term != row.part_number:
+                print(f"  link shows {term!r}; searching that, not {row.part_number!r}",
+                      file=sys.stderr)
+        return llm_scraper.find(term, row.units, llm, pool=cfg.pool, read=read,
+                                verbose=verbose)[2]
     return find
 
 
