@@ -70,9 +70,12 @@ covers anything added while it was down.
 rows with `Exported?` unchecked and a `Cat. or model no.`, `Quant.` and
 `Unit cost`; queued rows that don't qualify are dropped from the queue.
 
-**The check:** `scrapers.find` (the LLM scraper) searches the part number at that quantity
-(web + Mouser/DigiKey APIs + LLM), always reading the row's
-`Link to product webpage` too. The price at that link is used if it could be
+**The check:** the row's `Link to product webpage` is read first, and the
+manufacturer part number shown there (e.g. `Texas Instruments LM7805CT/NOPB`) is
+what gets searched; `Cat. or model no.` is only the fallback when there's no link,
+it can't be read, or it shows no part number, since that column is often a
+description ("M3 screws"). `scrapers.find` (the LLM scraper) searches it at that
+quantity (web + Mouser/DigiKey APIs + LLM). The price at that link is used if it could be
 read, else the best-ranked option, at the price break the quantity reaches.
 Rows written by `/parts` as packs ("Sold in packs of N" in the notes) are
 compared per unit. It alerts when the unit price differs from `Unit cost` by at

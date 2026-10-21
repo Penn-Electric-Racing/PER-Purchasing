@@ -108,6 +108,29 @@ class FakeSlack:
 
 
 # ---------------------------------------------------------------- rows
+def _find_spy(monkeypatch, link_info):
+    """make_find with part_info / find faked: returns (find, [(term, read urls)])."""
+    calls = []
+    monkeypatch.setattr(llm_scraper, "part_info", lambda r, llm, q: {**r, **link_info})
+    monkeypatch.setattr(llm_scraper, "find", lambda term, qty, llm, read=(), **k:
+                        calls.append((term, [r["url"] for r in read])) or ("", "", []))
+    return check.make_find(None, CFG), calls
+
+
+def test_find_searches_the_part_number_on_the_link(monkeypatch):
+    find, calls = _find_spy(monkeypatch, {"mpn": "91290A115", "manufacturer": None})
+    find(pc.parse_row(page(part="M3 socket head screws", link="https://mcmaster.com/x")))
+    assert calls == [("91290A115", ["https://mcmaster.com/x"])]
+
+
+def test_find_falls_back_to_the_row_without_a_part_number_on_the_link(monkeypatch):
+    find, calls = _find_spy(monkeypatch, {"mpn": None, "fetch_error": "HTTP 403"})
+    find(pc.parse_row(page(part="M3 socket head screws", link="https://mcmaster.com/x")))
+    find(pc.parse_row(page(part="M3 socket head screws", link="")))
+    assert calls == [("M3 socket head screws", ["https://mcmaster.com/x"]),
+                     ("M3 socket head screws", [])]
+
+
 def test_parse_row():
     r = pc.parse_row(page())
     assert (r.name, r.part_number, r.quantity, r.unit_cost) == ("5V regulator", "LM7805CT/NOPB", 50, 1.0)

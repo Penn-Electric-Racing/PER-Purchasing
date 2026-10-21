@@ -389,3 +389,21 @@ def test_to_info_product_name_and_listing():
     info = info_from({"product_name": "  LM7805 Regulator ", "listing_page": True, "pack_size": 20000})
     assert info["page_title"] == "LM7805 Regulator" and info["listing_page"] is True
     assert info["pack_size"] == 1  # absurd pack sizes are ignored
+
+
+def test_to_info_keeps_mpn_and_manufacturer():
+    info = info_from({"mpn": " LM7805CT/NOPB ", "manufacturer": "Texas Instruments"})
+    assert (info["mpn"], info["manufacturer"]) == ("LM7805CT/NOPB", "Texas Instruments")
+    assert info_from({"mpn": 7})["mpn"] is None
+
+
+@pytest.mark.parametrize("r, term", [
+    ({"mpn": "LM7805CT/NOPB", "manufacturer": "Texas Instruments"}, "Texas Instruments LM7805CT/NOPB"),
+    ({"mpn": "BSS138-7-F", "manufacturer": None}, "BSS138-7-F"),
+    ({"mpn": "TE 1-1445022-2", "manufacturer": "TE"}, "TE 1-1445022-2"),
+    ({"mpn": "Socket head screw", "manufacturer": "Bolt Co"}, None),   # no digit: not an MPN
+    ({"mpn": None, "manufacturer": "Bolt Co"}, None),
+    ({"mpn": "LM7805", "listing_page": True}, None),                    # search page, many parts
+])
+def test_search_term(r, term):
+    assert s.search_term(r) == term
