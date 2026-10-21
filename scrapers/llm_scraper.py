@@ -274,14 +274,51 @@ def _read_page(result):
     if text:
         prompt += f"Page text: {text}\n"
     info["_source"] = "llm" if text or ld else "llm snippet"
+    # What the page itself said, for checking the LLM's prices against. Not the URL or the
+    # result title: for a row's own link the title is the row's name, typed by a person.
+    info["_seen"] = f"{result['snippet']} {title} {ld} {text}"
     return info, prompt
+
+
+def _page_numbers(text):
+    """Every number written in `text` ("$1,234.50" -> 1234.5)."""
+    text = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)
+    return {float(n) for n in re.findall(r"\d+(?:\.\d+)?", text)}
+
+
+def _on_page(price, numbers):
+    """True if `price` is one of the page's numbers (to the cent, or finer under $1)."""
+    tol = 0.005 if price >= 1 else 0.00005
+    return any(abs(n - price) < tol for n in numbers)
+
+
+def drop_unseen_prices(info, seen):
+    """Clear prices the LLM gave that the page never showed. A page that didn't render
+    (McMaster-Carr sends a "requires JavaScript" shell) has no price on it, but the LLM can
+    still return one, and a made-up price at the row's own link would win the comparison."""
+    numbers = _page_numbers(seen)
+    dropped = []
+    if info["cost"] is not None and not _on_page(info["cost"], numbers):
+        dropped.append(info["cost"])
+        info["cost"] = info["cost_source"] = None
+    dropped += [p for _, p in info["price_breaks"] if not _on_page(p, numbers)]
+    info["price_breaks"] = [(q, p) for q, p in info["price_breaks"] if _on_page(p, numbers)]
+    if info["price_range"] and not all(_on_page(p, numbers) for p in info["price_range"]):
+        info["price_range"], info["price_count"] = None, 0
+    if dropped:
+        note = "llm price not on page: " + ", ".join(f"{p:g}" for p in dropped)
+        info["fetch_error"] = f"{info['fetch_error'] + '; ' if info['fetch_error'] else ''}{note}"
+    return info
 
 
 def _finish(result, info, reply=None, error=None):
     """Merge one page's LLM reply (or the LLM error) into its result dict."""
     source = info.pop("_source")
+    seen = info.pop("_seen", None)
     if reply is not None:
         to_info(reply, info, source)
+        if seen is not None:
+            drop_unseen_prices(info, seen)
     if error:
         info["fetch_error"] = f"{info['fetch_error'] + '; ' if info['fetch_error'] else ''}llm: {error}"
     info["supplier"] = info["supplier"] or urlparse(result["url"]).netloc.lower().removeprefix("www.")

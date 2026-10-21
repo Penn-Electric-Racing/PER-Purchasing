@@ -144,7 +144,7 @@ def test_failed_fetch_falls_back_to_snippet(monkeypatch):
 def test_parse_errors_stay_on_their_page(monkeypatch):
     monkeypatch.setattr(s, "_fetch_html", lambda url: PAGE)
     monkeypatch.setattr(s, "page_text", lambda html: 1 / 0)
-    r = s.part_info(result(), FakeLLM({"cost": 2}), "LM7805")
+    r = s.part_info(result(snippet="LM7805 $2"), FakeLLM({"cost": 2}), "LM7805")
     assert r["fetch_error"].startswith("parse error") and r["cost"] == 2
 
 
@@ -173,7 +173,7 @@ def test_snippets_info_maps_rows_by_index():
 # ---------------------------------------------------------------- batching
 def test_batch_sends_several_pages_per_request(monkeypatch):
     monkeypatch.setattr(s, "_fetch_html", lambda url: PAGE)
-    rs = [result(f"https://site{i}.com/p", f"LM7805 #{i}") for i in range(5)]
+    rs = [result(f"https://site{i}.com/p", f"LM7805 #{i}", "$1 $2 $3") for i in range(5)]
     llm = FakeLLM({"results": [{"index": i, "cost": i + 1} for i in range(3)]})
     out = s.pages_info(rs, llm, "LM7805", batch=3)
     assert len(llm.prompts) == 2  # 5 pages in groups of 3 + 2
@@ -186,7 +186,7 @@ def test_batch_sends_several_pages_per_request(monkeypatch):
 
 def test_batch_page_missing_from_reply_is_flagged(monkeypatch):
     monkeypatch.setattr(s, "_fetch_html", lambda url: PAGE)
-    rs = [result(f"https://site{i}.com/p") for i in range(3)]
+    rs = [result(f"https://site{i}.com/p", snippet="$1") for i in range(3)]
     out = s.pages_info(rs, FakeLLM({"results": [{"index": 0, "cost": 1}, "junk"]}), "LM7805", 3)
     assert out[0]["cost"] == 1 and out[1]["cost"] is None
     assert "no reply for this page" in out[1]["fetch_error"]
@@ -407,3 +407,49 @@ def test_to_info_keeps_mpn_and_manufacturer():
 ])
 def test_search_term(r, term):
     assert s.search_term(r) == term
+
+
+# ---------------------------------------------------------------- prices must be on the page
+JS_SHELL = """<html><head><title>McMaster-Carr</title></head><body>
+<nav>BROWSE CATALOG Abrading &amp; Polishing</nav>
+Our website requires JavaScript. Please enable it in your browser.
+To place an order, email us or call (630) 833-0300.</body></html>"""
+
+
+def test_price_from_a_page_that_never_rendered_is_dropped(monkeypatch):
+    monkeypatch.setattr(s, "_fetch_html", lambda url: JS_SHELL)
+    llm = FakeLLM({"cost": 14.58, "currency": "USD", "price_breaks": [{"min_qty": 10, "price": 12.9}]})
+    r = s.part_info(result("https://www.mcmaster.com/4459T251/", '0.25" tab stock'), llm, "4459T251")
+    assert r["cost"] is None and r["cost_source"] is None and r["price_breaks"] == []
+    assert r["fetch_error"] == "llm price not on page: 14.58, 12.9"
+
+
+def test_prices_shown_on_the_page_are_kept(monkeypatch):
+    monkeypatch.setattr(s, "_fetch_html", lambda url: PAGE)
+    llm = FakeLLM({"cost": 5.9, "price_breaks": [{"min_qty": 10, "price": 5.0}],
+                   "price_min": 5.9, "price_max": 9.99})
+    r = s.part_info(result(), llm, "LM7805")
+    assert r["cost"] == 5.9
+    assert r["price_breaks"] == []  # $5.00 isn't on PAGE: that break alone goes
+    assert r["fetch_error"] == "llm price not on page: 5"
+    assert r["price_range"] == [5.9, 9.99]
+
+
+def test_row_name_in_the_result_title_does_not_count_as_the_page():
+    info = {**s._blank_info(), "cost": 0.25}
+    s.drop_unseen_prices(info, "Our website requires JavaScript.")
+    assert info["cost"] is None
+
+
+@pytest.mark.parametrize("seen, price, kept", [
+    ("Total $1,234.50", 1234.5, True),
+    ("Unit price 0.0425", 0.0425, True),
+    ("Unit price 0.0425", 0.04, False),
+    ("$15", 15.0, True),
+    ("$15.00", 15.004, True),
+    ("$15.00", 15.01, False),
+])
+def test_drop_unseen_prices_number_matching(seen, price, kept):
+    info = {**s._blank_info(), "cost": price}
+    s.drop_unseen_prices(info, seen)
+    assert (info["cost"] == price) is kept
