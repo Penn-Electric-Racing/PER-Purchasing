@@ -24,6 +24,23 @@ def _flags(r):
     return [n for n in r.get("notes", []) if n != "shipping cost estimated"]
 
 
+def _found_flags(r):
+    """The found listing's flags, plus a stock warning when the page didn't show any."""
+    unknown = r.get("enough_stock") is None and r.get("in_stock") is None
+    return _flags(r) + (["stock not shown - check it's available"] if unknown else [])
+
+
+def _viewable(url):
+    """True when the listing gets a View button (see alert_links)."""
+    return bool(_HTTP_URL_RE.match(url or "")) and len(url) <= 3000
+
+
+def _supplier(r):
+    """The listing's supplier, linked only when it has no View button (one link per listing)."""
+    name = r.get("supplier") or "listing"
+    return name if _viewable(r.get("url")) else f"<{r['url']}|{name}>"
+
+
 def price_break(r):
     """" (25+ price)" when a quantity price break set this listing's unit price, else ""."""
     bought = (r.get("packs_needed") or 0) * (r.get("pack_size") or 1)
@@ -37,7 +54,6 @@ def format_alert(f):
     row, qty = f.row, f.row.units
     up = f.delta_pct > 0
     where = "at your link" if f.at_link else "best option found"
-    supplier = f.found.get("supplier") or "listing"
     lines = [
         f"{':chart_with_upwards_trend:' if up else ':chart_with_downwards_trend:'} "
         f"*Price {'went up' if up else 'dropped'} on <{row.url}|{row.name or row.part_number}>*"
@@ -45,16 +61,16 @@ def format_alert(f):
         f"• In Notion: ${money(row.unit_price)}/unit (${money(row.unit_price * qty)})"
         + (f", ${money(row.unit_cost)}/pack of {row.pack_size}" if row.pack_size > 1 else ""),
         f"• Now ({where}): ${money(f.found_unit)}/unit{price_break(f.found)} "
-        f"(${money(f.found_unit * qty)}) at "
-        f"<{f.found['url']}|{supplier}> - *{f.delta_pct:+.0f}%*",
+        f"(${money(f.found_unit * qty)}) at {_supplier(f.found)} - *{f.delta_pct:+.0f}%*",
     ]
+    if f.link_unavailable:
+        lines.append(f"• Your link: {f.link_unavailable}, so it isn't compared")
     if f.cheaper:
         c = f.cheaper
-        lines.append(f"• Cheaper option: ${money(c['unit_cost'])}/unit at "
-                     f"<{c['url']}|{c.get('supplier') or 'listing'}>"
+        lines.append(f"• Cheaper option: ${money(c['unit_cost'])}/unit at {_supplier(c)}"
                      + (f" ({_flags(c)[0]})" if _flags(c) else ""))
-    if _flags(f.found):
-        lines.append(f"• Flags: {'; '.join(_flags(f.found))}")
+    if _found_flags(f.found):
+        lines.append(f"• Flags: {'; '.join(_found_flags(f.found))}")
     lines.append("_Tap a button to update `Unit cost` in Notion, or edit it there. Prices "
                  "are read automatically from the listing, so check before ordering._")
     return "\n".join(lines)
@@ -117,7 +133,7 @@ def alert_links(f):
     links = []
     for i, o in enumerate(options):
         url = o.get("url") or ""
-        if not _HTTP_URL_RE.match(url) or len(url) > 3000:
+        if not _viewable(url):
             continue
         mine = bool(f.row.link and _same_url(url, f.row.link))
         label = f"View {o.get('supplier') or 'listing'}{' (your link)' if mine else ''} ↗"

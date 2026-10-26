@@ -188,8 +188,83 @@ def test_cheaper_option_is_reported():
     text = pc.format_alert(f)
     assert "*Price went up on <https://www.notion.so/p1|5V regulator>*" in text
     assert "$1.30/unit ($65.00)" in text and "*+30%*" in text
-    assert "Cheaper option: $0.80/unit at <https://shop.com/p|shop.com>" in text
-    assert "shipping cost estimated" not in text
+    # Supplier names are plain text: each listing's link is its View button, not a second link.
+    assert "($65.00) at www.digikey.com - *+30%*" in text
+    assert "Cheaper option: $0.80/unit at shop.com" in text and "<https://shop.com" not in text
+    assert "shipping cost estimated" not in text and "Flags" not in text
+
+
+def test_supplier_is_linked_when_it_gets_no_view_button():
+    row = pc.parse_row(page(cost=1.00, link=""))
+    long = "https://shop.com/" + "x" * 3000
+    f = pc.compare(row, scored(listing(long, 1.50)), CFG)
+    assert pc.alert_links(f) is None and f"at <{long}|shop.com>" in pc.format_alert(f)
+
+
+def test_out_of_stock_link_falls_back_to_an_in_stock_option():
+    row = pc.parse_row(page(cost=1.00))
+    rs = scored(listing(row.link, 0.50, in_stock=False), listing("https://shop.com/p", 0.80))
+    f = pc.compare(row, rs, CFG)
+    assert not f.at_link and f.found["url"] == "https://shop.com/p" and f.delta_pct == -20.0
+    assert f.link_unavailable == "out of stock" and f.cheaper is None
+    text = pc.format_alert(f)
+    assert "Now (best option found): $0.80/unit" in text
+    assert "• Your link: out of stock, so it isn't compared" in text
+    labels = [b["text"]["text"] for b in pc.alert_buttons(f)["elements"]]
+    assert labels == ["Use $0.80/unit · shop.com", "Keep $1.00/unit"]
+
+
+@pytest.mark.parametrize("kw", [{"in_stock": False}, {"stock": 10}])
+def test_no_alert_when_only_unorderable_listings_moved(kw):
+    row = pc.parse_row(page(cost=1.00))
+    assert pc.compare(row, scored(listing(row.link, 0.50, **kw)), CFG) is None
+    assert pc.compare(row, scored(listing(row.link, 0.50, **kw),
+                                  listing("https://shop.com/p", 0.40, **kw)), CFG) is None
+
+
+FUSE_CT = "https://www.digikey.com/en/products/detail/schurter-inc/3403-0291-23/486-3403.0291.23CT-ND"
+FUSE_BREAKS = [(1, 4.68), (5, 3.884), (10, 3.584), (50, 2.9726)]
+
+
+def fuse(**kw):
+    """The 50A fuse alert of 2026-10-26: Notion had DigiKey's Cut Tape price at 5 ($3.884)
+    and the LLM read $1.95 off the page, which DigiKey doesn't sell it for."""
+    row = pc.parse_row(page(part="486-3403.0291.23CT-ND", qty=5, cost=3.88, link=FUSE_CT))
+    title = "3403.0291.23 SCHURTER"
+    read = listing(FUSE_CT, 1.95, qty=5, title=title, supplier="DigiKey", mpn="3403.0291.23")
+    api = listing("https://www.digikey.com/en/products/detail/schurter-inc/3403-0291-23/123",
+                  4.68, qty=5, title=title + " | DigiKey (486-3403.0291.23CT-ND, Cut Tape)",
+                  supplier="DigiKey", cost_source="api", mpn="3403.0291.23", stock=2518,
+                  price_breaks=FUSE_BREAKS, **kw)
+    return row, read, api
+
+
+def test_digikey_link_is_priced_from_the_api_not_the_page():
+    row, read, api = fuse()
+    assert pc.compare(row, scored(read, api, query="3403.0291.23", qty=5), CFG) is None
+
+
+def test_api_price_at_the_link_alerts_and_keeps_the_rows_link():
+    row, read, api = fuse()
+    row.unit_cost = 5.00
+    f = pc.compare(row, scored(read, api, query="3403.0291.23", qty=5), CFG)
+    assert f.at_link and f.found_unit == 3.884 and f.found["url"] == FUSE_CT
+    assert f.cheaper is None   # not the LLM's $1.95 reading of the same page
+    assert "l" not in json.loads(pc.alert_buttons(f)["elements"][0]["value"])
+
+
+def test_minimum_order_counts_in_the_unit_price():
+    row = pc.parse_row(page(cost=1.00, qty=2, link=""))
+    moq = listing("https://shop.com/p", 0.50, qty=2, min_order=10)
+    f = pc.compare(row, scored(moq, qty=2), CFG)
+    assert f.found_unit == 2.5 and f.delta_pct == 150.0   # 10 x $0.50 for the 2 needed
+    assert "buys 10 to get 2" in pc.format_alert(f)
+
+
+def test_unknown_stock_is_flagged():
+    row = pc.parse_row(page(cost=1.00))
+    f = pc.compare(row, scored(listing(row.link, 0.50, in_stock=None)), CFG)
+    assert "• Flags: stock not shown - check it's available" in pc.format_alert(f)
 
 
 @pytest.mark.parametrize("n, s", [(1234.5, "1,234.50"), (0.8, "0.80"), (0.0425, "0.0425"),

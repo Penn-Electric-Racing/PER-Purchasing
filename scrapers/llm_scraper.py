@@ -75,7 +75,9 @@ Return ONLY a JSON object with these keys (null when the page doesn't say):
   "manufacturer":   string, who makes the item (not the store)
   "cost":           number, price of ONE listing as sold (one unit, or one pack if sold in packs)
                     at quantity 1; not struck-out/was/list prices, not shipping, not accessories
-                    or "related items"
+                    or "related items". When the page offers several packagings (Cut Tape,
+                    Tape & Reel, Digi-Reel...), the one you can buy a few of (usually Cut Tape),
+                    never a reel's bulk price
   "currency":       ISO code like "USD"
   "supplier":       string, the store/seller name
   "listing_page":   true if this is a search/category page with many different items

@@ -77,6 +77,15 @@ it can't be read, or it shows no part number, since that column is often a
 description ("M3 screws"). `scrapers.find` (the LLM scraper) searches it at that
 quantity (web + Mouser/DigiKey APIs + LLM). The price at that link is used if it could be
 read, else the best-ranked option, at the price break the quantity reaches.
+When the link is a DigiKey or Mouser page and that distributor's API returned
+the same part, the API's price is used instead of the page reading: it's exact
+per packaging, where a page with Cut Tape and Tape & Reel tables can be misread.
+Prices count a minimum order or pack that makes you buy more than you need
+(2 needed, minimum 10 at $1 = $5/unit), and the DM says so.
+A listing that's out of stock (or has less than `Quant.`) never drives an alert:
+if your link is out of stock, the best in-stock option is compared instead and
+the DM says why ("Your link: out of stock"). If nothing in stock was found,
+there's no alert. When a page doesn't show stock at all, the DM flags it.
 Rows written by `/parts` as packs ("Sold in packs of N" in the notes) are
 compared per unit. It alerts when the unit price differs from `Unit cost` by at
 least `PRICE_CHECK_THRESHOLD_PCT` (default 10) and the order total by at least
