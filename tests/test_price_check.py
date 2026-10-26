@@ -222,6 +222,45 @@ def test_no_alert_when_only_unorderable_listings_moved(kw):
                                   listing("https://shop.com/p", 0.40, **kw)), CFG) is None
 
 
+FUSE_CT = "https://www.digikey.com/en/products/detail/schurter-inc/3403-0291-23/486-3403.0291.23CT-ND"
+FUSE_BREAKS = [(1, 4.68), (5, 3.884), (10, 3.584), (50, 2.9726)]
+
+
+def fuse(**kw):
+    """The 50A fuse alert of 2026-10-26: Notion had DigiKey's Cut Tape price at 5 ($3.884)
+    and the LLM read $1.95 off the page, which DigiKey doesn't sell it for."""
+    row = pc.parse_row(page(part="486-3403.0291.23CT-ND", qty=5, cost=3.88, link=FUSE_CT))
+    title = "3403.0291.23 SCHURTER"
+    read = listing(FUSE_CT, 1.95, qty=5, title=title, supplier="DigiKey", mpn="3403.0291.23")
+    api = listing("https://www.digikey.com/en/products/detail/schurter-inc/3403-0291-23/123",
+                  4.68, qty=5, title=title + " | DigiKey (486-3403.0291.23CT-ND, Cut Tape)",
+                  supplier="DigiKey", cost_source="api", mpn="3403.0291.23", stock=2518,
+                  price_breaks=FUSE_BREAKS, **kw)
+    return row, read, api
+
+
+def test_digikey_link_is_priced_from_the_api_not_the_page():
+    row, read, api = fuse()
+    assert pc.compare(row, scored(read, api, query="3403.0291.23", qty=5), CFG) is None
+
+
+def test_api_price_at_the_link_alerts_and_keeps_the_rows_link():
+    row, read, api = fuse()
+    row.unit_cost = 5.00
+    f = pc.compare(row, scored(read, api, query="3403.0291.23", qty=5), CFG)
+    assert f.at_link and f.found_unit == 3.884 and f.found["url"] == FUSE_CT
+    assert f.cheaper is None   # not the LLM's $1.95 reading of the same page
+    assert "l" not in json.loads(pc.alert_buttons(f)["elements"][0]["value"])
+
+
+def test_minimum_order_counts_in_the_unit_price():
+    row = pc.parse_row(page(cost=1.00, qty=2, link=""))
+    moq = listing("https://shop.com/p", 0.50, qty=2, min_order=10)
+    f = pc.compare(row, scored(moq, qty=2), CFG)
+    assert f.found_unit == 2.5 and f.delta_pct == 150.0   # 10 x $0.50 for the 2 needed
+    assert "buys 10 to get 2" in pc.format_alert(f)
+
+
 def test_unknown_stock_is_flagged():
     row = pc.parse_row(page(cost=1.00))
     f = pc.compare(row, scored(listing(row.link, 0.50, in_stock=None)), CFG)
