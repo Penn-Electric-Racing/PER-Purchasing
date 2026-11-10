@@ -10,12 +10,14 @@ cost, currency, supplier, shipping time/cost, free-shipping minimum, stock,
 pack size and quantity price breaks.
 
 LLM providers (first one with a key wins; all speak the OpenAI chat API):
-  1. Google Gemini   free tier, no card         env: GEMINI_API_KEY
+  1. OpenAI          paid                       env: OPENAI_API_KEY
+                     https://platform.openai.com/api-keys
+  2. Google Gemini   free tier, no card         env: GEMINI_API_KEY
                      https://aistudio.google.com/apikey
-  2. Groq            free tier, no card         env: GROQ_API_KEY
+  3. Groq            free tier, no card         env: GROQ_API_KEY
                      https://console.groq.com/keys
-  3. OpenRouter      ":free" models             env: OPENROUTER_API_KEY
-  4. Ollama          local, free, no key        (if running on localhost:11434)
+  4. OpenRouter      ":free" models             env: OPENROUTER_API_KEY
+  5. Ollama          local, free, no key        (if running on localhost:11434)
 Override the model with LLM_MODEL=... or --model, the provider with --provider.
 
 Free tiers are rate-limited per minute, so requests are paced (--rpm) and
@@ -23,7 +25,7 @@ Free tiers are rate-limited per minute, so requests are paced (--rpm) and
 
 Usage:
     pip install requests beautifulsoup4
-    export GEMINI_API_KEY=...
+    export OPENAI_API_KEY=...
     python -m scrapers.llm_scraper "LM7805 voltage regulator"
     python -m scrapers.llm_scraper "LM7805" -q 50 --json
     python -m scrapers.llm_scraper "LM7805" --no-fetch          # one LLM call over all snippets
@@ -51,6 +53,8 @@ from .websearch import BackendError, _fetch_html, _search_help, search
 
 # provider -> (base url, api key env var or None, default model)
 PROVIDERS = {
+    "openai": ("https://api.openai.com/v1",
+               "OPENAI_API_KEY", "gpt-5-mini"),
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai",
                "GEMINI_API_KEY", "gemini-3.1-flash-lite"),
     "groq": ("https://api.groq.com/openai/v1",
@@ -60,9 +64,9 @@ PROVIDERS = {
     "ollama": ("http://localhost:11434/v1", None, "llama3.2"),
 }
 # Pages sent per LLM request (--batch). Fewer, bigger requests save free-tier daily quota;
-# only Gemini's free tier has room for several pages per request (Groq's tokens-per-minute
+# OpenAI (paid) and Gemini's free tier have room for several pages per request (Groq's tokens-per-minute
 # limit is small, and Ollama's default context window would cut the prompt off).
-BATCH_DEFAULT = {"gemini": 5, "groq": 1, "openrouter": 1, "ollama": 1}
+BATCH_DEFAULT = {"openai": 5, "gemini": 5, "groq": 1, "openrouter": 1, "ollama": 1}
 PAGE_CHARS = 8000   # page text sent per page (~2k tokens): keeps free-tier TPM happy
 LD_CHARS = 3000     # JSON-LD sent per call
 
@@ -110,7 +114,7 @@ class LLM:
                              if env and os.getenv(env)), None) or \
                 ("ollama" if _ollama_up() else None)
         if provider is None:
-            raise LLMError("no LLM configured: set GEMINI_API_KEY (free at "
+            raise LLMError("no LLM configured: set OPENAI_API_KEY, GEMINI_API_KEY (free at "
                            "https://aistudio.google.com/apikey), GROQ_API_KEY or "
                            "OPENROUTER_API_KEY, or run Ollama locally")
         base, env, default = PROVIDERS[provider]
@@ -136,10 +140,15 @@ class LLM:
         Retries 429/5xx (honouring Retry-After), network errors and non-JSON replies up
         to `retries` times; raises LLMError on other HTTP errors or when retries run out.
         """
-        body = {"model": self.model, "temperature": 0,
+        body = {"model": self.model,
                 "response_format": {"type": "json_object"},
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user}]}
+        if self.provider == "openai" and self.model.startswith(("gpt-5", "o")):
+            # OpenAI reasoning models reject temperature; keep reasoning short for extraction.
+            body["reasoning_effort"] = "low"
+        else:
+            body["temperature"] = 0
         last = None
         for attempt in range(retries + 1):
             self._wait_turn()
@@ -492,7 +501,7 @@ def main():
                    help="max LLM requests per minute (default 15, Gemini's free limit)")
     p.add_argument("--batch", type=int, metavar="N",
                    help="pages per LLM request; fewer requests save daily quota "
-                        "(default 5 for gemini, 1 for others)")
+                        "(default 5 for openai/gemini, 1 for others)")
     p.add_argument("--weights", metavar="FILE",
                    help="JSON file overriding ranking weights, e.g. {\"out_of_stock\": 2.0} "
                         "(see Weights in ranking.py)")

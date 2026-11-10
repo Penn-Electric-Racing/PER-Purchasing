@@ -125,7 +125,7 @@ It runs on Render as a web service (`render.yaml`), next to PERBot.
    sleeps after 15 minutes idle, which pauses the checks).
 3. **Fill in the keys it asks for:** `NOTION_TOKEN` and `SLACK_BOT_TOKEN`
    (copy them from PERBot's Render service → Environment), `SERPER_API_KEY`,
-   `GEMINI_API_KEY`, and optionally the Mouser/DigiKey/Groq keys and
+   `OPENAI_API_KEY`, and optionally the Mouser/DigiKey/Gemini/Groq keys and
    `PRICE_CHECK_CHANNEL`. Leave `NOTION_WEBHOOK_SECRET` empty for now.
 4. **Check it's up:** `https://per-price-listener.onrender.com/healthz` returns
    `{"ok": true, ...}`. The service's **Logs** show the startup catch-up.
@@ -158,7 +158,7 @@ match PERBot's, so the same values work in both.
 | `SLACK_BOT_TOKEN` | required | PERBot's bot token (`chat:write`, `users:read`, `users:read.email`) |
 | `NOTION_WEBHOOK_SECRET` | required | The webhook subscription's verification token |
 | `SERPER_API_KEY` / `BRAVE_API_KEY` | one required | Web search (DuckDuckGo blocks cloud servers) |
-| `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` | one required | LLM that reads product pages |
+| `OPENAI_API_KEY` / `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` | one required | LLM that reads product pages |
 | `MOUSER_API_KEY`, `DIGIKEY_CLIENT_ID` + `DIGIKEY_CLIENT_SECRET` | optional | Exact distributor prices and stock |
 | `PRICE_CHECK_THRESHOLD_PCT` | `10` | Alert when the unit price moved at least this much (%) |
 | `PRICE_CHECK_MIN_DELTA_USD` | `0` | ...and the order total moved at least this much ($) |
@@ -280,6 +280,7 @@ distributor's site for the current amount.
 
 | Provider | Free tier | Environment variable | Default model |
 |---|---|---|---|
+| [OpenAI](https://platform.openai.com/api-keys) | no (paid) | `OPENAI_API_KEY` | `gpt-5-mini` |
 | [Google Gemini](https://aistudio.google.com/apikey) | yes, no card | `GEMINI_API_KEY` | `gemini-3.1-flash-lite` |
 | [Groq](https://console.groq.com/keys) | yes, no card | `GROQ_API_KEY` | `qwen/qwen3.8-27b` |
 | [OpenRouter](https://openrouter.ai) | `:free` models | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct:free` |
@@ -301,7 +302,7 @@ python -m scrapers.regex_scraper "LM7805" --json             # machine-readable 
 python -m scrapers.regex_scraper "LM7805" --no-fetch         # search snippets only (fast)
 python -m scrapers.regex_scraper "LM7805" --weights w.json   # custom ranking weights
 
-export GEMINI_API_KEY=...
+export OPENAI_API_KEY=...
 python -m scrapers.llm_scraper "LM7805" -q 50 -v             # same, with LLM extraction
 python -m scrapers.llm_scraper "LM7805" --provider groq --rpm 30
 python -m scrapers.llm_scraper "LM7805" --no-fetch           # one LLM call over all snippets
@@ -327,7 +328,7 @@ python -m scrapers.llm_scraper "LM7805" --no-fetch           # one LLM call over
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--provider` | first with a key | `gemini`, `groq`, `openrouter` or `ollama`. |
+| `--provider` | first with a key | `openai`, `gemini`, `groq`, `openrouter` or `ollama`. |
 | `--model` | provider default | LLM model ID (or set `LLM_MODEL`). |
 | `--rpm N` | 15 | Maximum LLM requests per minute, to stay inside free-tier limits. 30 pages at 15 rpm takes about 2 minutes. |
 

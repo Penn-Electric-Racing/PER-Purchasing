@@ -253,7 +253,7 @@ def chat(content):
 
 @pytest.fixture
 def no_keys(monkeypatch):
-    for env in ("GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "LLM_MODEL"):
+    for env in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "LLM_MODEL"):
         monkeypatch.delenv(env, raising=False)
     monkeypatch.setattr(s, "_ollama_up", lambda: False)
 
@@ -286,6 +286,19 @@ def test_first_provider_with_a_key_wins(no_keys, monkeypatch):
     llm = s.LLM()
     assert llm.provider == "groq" and llm.key == "b"
     assert llm.url == "https://api.groq.com/openai/v1/chat/completions"
+
+
+def test_openai_preferred_and_omits_temperature(no_keys, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("OPENAI_API_KEY", "o")
+    monkeypatch.setattr(s.time, "sleep", lambda t: None)
+    llm = s.LLM(rpm=60)
+    assert llm.provider == "openai" and llm.key == "o"
+    assert llm.url == "https://api.openai.com/v1/chat/completions"
+    calls = replies(monkeypatch, chat('{"cost": 1.5}'))
+    assert llm.json("sys", "user") == {"cost": 1.5}
+    body = calls[0]["body"]
+    assert "temperature" not in body and body["model"] == "gpt-5-mini"
 
 
 def test_ollama_used_when_running_and_no_keys(no_keys, monkeypatch):

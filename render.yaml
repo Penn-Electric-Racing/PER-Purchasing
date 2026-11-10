@@ -28,9 +28,11 @@ services:
       # Web search (DuckDuckGo blocks Render's IPs) and the LLM that reads product pages.
       - key: SERPER_API_KEY
         sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      # Optional: exact distributor prices; Gemini/Groq as fallback LLMs.
       - key: GEMINI_API_KEY
         sync: false
-      # Optional: exact distributor prices; Groq as a second LLM.
       - key: MOUSER_API_KEY
         sync: false
       - key: DIGIKEY_CLIENT_ID
